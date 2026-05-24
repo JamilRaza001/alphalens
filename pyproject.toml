@@ -15,6 +15,7 @@ dependencies = [
 
     # Database
     "asyncpg>=0.29.0",
+    "psycopg[binary]>=3.2",
     "pgvector>=0.3.0",
     "alembic>=1.13.0",
     "sqlalchemy>=2.0.0",
@@ -86,3 +87,8 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+]
