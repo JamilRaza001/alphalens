@@ -8,6 +8,7 @@ Use :func:`get_settings` everywhere — never instantiate :class:`Settings` dire
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from typing import Literal
 
@@ -36,6 +37,10 @@ class Settings(BaseSettings):
     r2_secret_access_key: SecretStr
     r2_bucket_name: str = "alphalens-filings"
     r2_endpoint_url: str
+
+    # ── SEC EDGAR ─────────────────────────────────────────────────────────────
+    # Required format: "Your Name email@domain" — enforced by SEC; generic UAs trigger IP bans.
+    sec_edgar_user_agent: str
 
     # ── LLM — Groq (L8) ───────────────────────────────────────────────────────
     groq_api_key: SecretStr
@@ -88,6 +93,16 @@ class Settings(BaseSettings):
         return os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None
 
     # ── Validators ────────────────────────────────────────────────────────────
+
+    @field_validator("sec_edgar_user_agent")
+    @classmethod
+    def _validate_sec_ua(cls, v: str) -> str:
+        if not re.fullmatch(r"^[\w .'-]+ \S+@\S+\.\S+$", v):
+            raise ValueError(
+                "sec_edgar_user_agent must be 'Your Name email@domain' "
+                f"(e.g. 'AlphaLens admin@alphalens.ai'); got {v!r}"
+            )
+        return v
 
     @field_validator("jina_dimensions")
     @classmethod

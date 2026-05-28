@@ -8,39 +8,34 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "sse-starlette>=2.1.0",
-
     # LangGraph agent
     "langgraph>=0.2.0",
     "langchain-groq>=0.1.0",
-
     # Database
     "asyncpg>=0.29.0",
     "psycopg[binary]>=3.2",
     "pgvector>=0.3.0",
     "alembic>=1.13.0",
     "sqlalchemy>=2.0.0",
-
     # Embeddings + reranker
     "httpx>=0.27.0",
     "sentence-transformers>=3.0.0",
     "torch>=2.3.0",
-
     # ETL
     "beautifulsoup4>=4.12.0",
     "lxml>=5.2.0",
     "spacy>=3.7.0",
     "boto3>=1.34.0",            # R2 S3-compat client
-
     # Auth
     "pyjwt[crypto]>=2.8.0",
-
     # Observability
     "opik>=1.0.0",
     "sentry-sdk[fastapi]>=2.0.0",
-
     # Config
     "pydantic-settings>=2.3.0",
     "python-dotenv>=1.0.0",
+    "tenacity>=9.0.0",
+    "aioboto3>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -76,6 +71,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: marks tests requiring live external services (deselect with '-m not integration')",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/alphalens"]
