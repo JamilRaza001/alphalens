@@ -7,3 +7,4 @@
 | S5 | EDGAR Client | DONE | `a3adc27` | async SEC client, R2 cache-through, token-bucket rate limiter (10 req/s), tenacity retry (429/5xx), SEC_EDGAR_USER_AGENT validator |
 | S6 | Section Detector | DONE | `313eaf7` | hybrid text-pattern detection (not DOM), 10-K flat + 10-Q Part I/II disambig, table strip+count, TOC guard, O7 unstructured fallback; 15 unit + 1 real-10-K integration test |
 | S7 | Chunker | DONE | `662a78a` | token/section/sentence-aware chunking, ~400 tok/50 overlap, spaCy splitter + nomic counter (DI), oversized-sentence + unstructured fallback, per-section index; 21 unit + 1 real-models integration test |
+| S8 | Embedding Client | DONE | `bb038ff` | Jina v3 primary (truncate_dim=768) + nomic-embed-text-v1.5 fallback (native 768d), async w/ lazy nomic load + to_thread, quota auto-flip (8M/10M), 402 whole-call re-embed, 768d asserts, RRF-ready; einops dep added; 20 unit + 1 real-models integration test
