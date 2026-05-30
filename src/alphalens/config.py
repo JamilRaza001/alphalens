@@ -54,6 +54,7 @@ class Settings(BaseSettings):
 
     # ── Embeddings — nomic fallback (L18) ─────────────────────────────────────
     nomic_model: str = "nomic-ai/nomic-embed-text-v1.5"
+    embedding_batch_size: int = 128  # texts per Jina/nomic API call
 
     # ── Reranker (L3, L14) ────────────────────────────────────────────────────
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
