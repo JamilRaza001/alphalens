@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     embedding_model_version TEXT,             -- 'jina-v3' | 'nomic-embed-text-v1.5' (L9)
     token_count            INTEGER,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    section_order          INTEGER NOT NULL DEFAULT 0,         -- section order within filing (S9)
+    metadata               JSONB NOT NULL DEFAULT '{}'::jsonb, -- chunker meta + section_chunk_index (S9)
     UNIQUE (filing_id, chunk_index)
 );
 

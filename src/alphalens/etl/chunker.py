@@ -9,10 +9,10 @@ Three invariants:
   3. token_count is measured with the same tokenizer as the downstream embedder
      (nomic-embed-text-v1.5 WordPiece, add_special_tokens=False).
 
-DB schema notes (S8 concern):
-  - Chunk.section_order has no matching column in chunks table yet; S8 migration adds it.
-  - Chunk.metadata has no matching JSONB column yet; S8 migration adds it.
-  - Chunk.chunk_index is per-section here; S8 re-indexes globally before DB upsert.
+DB schema notes (S9 concern):
+  - Chunk.section_order has no matching column in chunks table yet; S9 migration adds it.
+  - Chunk.metadata has no matching JSONB column yet; S9 migration adds it.
+  - Chunk.chunk_index is per-section here; S9 re-indexes globally before DB upsert.
 """
 
 from __future__ import annotations
