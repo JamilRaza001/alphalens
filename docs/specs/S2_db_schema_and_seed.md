@@ -2,7 +2,7 @@
 
 \## Goal
 
-Bootstrap Neon Postgres with pgvector schema (5 tables, HNSW + GIN indexes) per v8 §6.1, seed 10 companies, and scaffold Claude Code context files (CLAUDE.md + PROJECT\_STATUS.md) per L23.
+Bootstrap Neon Postgres with pgvector schema (4 tables, HNSW + GIN indexes) per v8 §6.1, seed 10 companies, and scaffold Claude Code context files (CLAUDE.md + PROJECT\_STATUS.md) per L23.
 
 \## Files to Create
 
@@ -46,145 +46,79 @@ Single table tracking phase progress. Columns: Spec | Title | Status | Commit | 
 
 \## Task 1 — Schema SQL (\`scripts/create\_schema.sql\`)
 
-Five tables (per v8 §6.1 — verify against your design doc, adjust column names if drift exists):
+Four tables (per v8 §6.1 — reconciled to live schema, decisions #1–#8):
 
-\`\`\`sql
+```sql
+-- Required extensions
+CREATE EXTENSION IF NOT EXISTS vector;    -- pgvector for embedding column
+CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- for gen_random_uuid()
 
-\-- Required extensions
-
-CREATE EXTENSION IF NOT EXISTS vector; -- pgvector for embedding column
-
-CREATE EXTENSION IF NOT EXISTS pgcrypto; -- for gen\_random\_uuid()
-
-\-- 1. companies — master list of 10 tickers
-
+-- 1. companies — master list of 10 tickers
 CREATE TABLE IF NOT EXISTS companies (
-
-ticker TEXT PRIMARY KEY,
-
-name TEXT NOT NULL,
-
-cik TEXT NOT NULL UNIQUE, -- SEC Central Index Key, 10-digit zero-padded
-
-sector TEXT,
-
-created\_at TIMESTAMPTZ NOT NULL DEFAULT now()
-
+    cik TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    sector TEXT,
+    sic_code TEXT,
+    fiscal_year_end TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-\-- 2. filings — 10-K / 10-Q metadata, points to R2 object
-
+-- 2. filings — 10-K / 10-Q metadata, points to R2 object
 CREATE TABLE IF NOT EXISTS filings (
-
-filing\_id UUID PRIMARY KEY DEFAULT gen\_random\_uuid(),
-
-ticker TEXT NOT NULL REFERENCES companies(ticker) ON DELETE CASCADE,
-
-filing\_type TEXT NOT NULL CHECK (filing\_type IN ('10-K', '10-Q')),
-
-filing\_date DATE NOT NULL,
-
-period\_end DATE NOT NULL,
-
-accession\_number TEXT NOT NULL UNIQUE, -- SEC's unique ID per filing
-
-r2\_key TEXT NOT NULL, -- path in R2 bucket
-
-status TEXT NOT NULL DEFAULT 'pending'
-
-CHECK (status IN ('pending', 'processing', 'processed', 'failed')),
-
-created\_at TIMESTAMPTZ NOT NULL DEFAULT now()
-
+    filing_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cik TEXT NOT NULL REFERENCES companies(cik) ON DELETE CASCADE,
+    ticker TEXT NOT NULL,                          -- convenience column; cik is the FK
+    filing_type TEXT NOT NULL CHECK (filing_type IN ('10-K', '10-Q')),
+    filing_date DATE NOT NULL,
+    period_end DATE NOT NULL,
+    accession_number TEXT NOT NULL UNIQUE,         -- SEC's unique ID per filing
+    r2_key TEXT NOT NULL,                          -- path in R2 bucket
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'processed', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_filings_cik_date ON filings(cik, filing_date DESC);
+CREATE INDEX IF NOT EXISTS idx_filings_ticker_date ON filings(ticker, filing_date DESC);
 
-CREATE INDEX IF NOT EXISTS idx\_filings\_ticker\_date ON filings(ticker, filing\_date DESC);
-
-\-- 3. chunks — text chunks with embedding + tsvector (the heart of RAG)
-
+-- 3. chunks — text chunks with embedding + tsvector (the heart of RAG)
 CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    filing_id UUID NOT NULL REFERENCES filings(filing_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,                  -- filing-global, 0-based, contiguous
+    section TEXT,                                  -- e.g. "Item 1A", "MD&A"
+    section_order INTEGER NOT NULL DEFAULT 0,      -- position in filing for ordering
+    text TEXT NOT NULL,
+    tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+    embedding VECTOR(768),                         -- Jina v3 truncated / nomic native
+    embedding_model_version TEXT,                  -- 'jina-v3' | 'nomic-embed-text-v1.5'
+    token_count INTEGER,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (filing_id, chunk_index)
+);
+-- HNSW for dense vector search (cosine — Jina/nomic produce normalized vectors)
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw
+    ON chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+-- GIN for lexical search via ts_rank_cd (hybrid retrieval)
+CREATE INDEX IF NOT EXISTS idx_chunks_tsv_gin ON chunks USING gin (tsv);
 
-chunk\_id UUID PRIMARY KEY DEFAULT gen\_random\_uuid(),
-
-filing\_id UUID NOT NULL REFERENCES filings(filing\_id) ON DELETE CASCADE,
-
-chunk\_index INTEGER NOT NULL, -- order within filing
-
-section TEXT, -- e.g. "Item 1A", "MD&A"
-
-text TEXT NOT NULL,
-
-tsv TSVECTOR GENERATED ALWAYS AS (to\_tsvector('english', text)) STORED,
-
-embedding VECTOR(768), -- Jina v3 truncated / nomic native
-
-token\_count INTEGER,
-
-created\_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-UNIQUE (filing\_id, chunk\_index)
-
+-- 4. ingestion_jobs — per-attempt ETL audit trail (see §8.2 two-level state model)
+CREATE TABLE IF NOT EXISTS ingestion_jobs (
+    job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    filing_id UUID NOT NULL REFERENCES filings(filing_id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'done', 'failed')),
+    step TEXT CHECK (step IN ('download', 'parse', 'chunk', 'embed', 'upsert')),
+    error TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-\-- HNSW for dense vector search (cosine — Jina/nomic produce normalized vectors)
-
-CREATE INDEX IF NOT EXISTS idx\_chunks\_embedding\_hnsw
-
-ON chunks USING hnsw (embedding vector\_cosine\_ops)
-
-WITH (m = 16, ef\_construction = 64);
-
-\-- GIN for BM25-style keyword search (hybrid retrieval)
-
-CREATE INDEX IF NOT EXISTS idx\_chunks\_tsv\_gin
-
-ON chunks USING gin (tsv);
-
-\-- 4. queries — observability / Opik feed
-
-CREATE TABLE IF NOT EXISTS queries (
-
-query\_id UUID PRIMARY KEY DEFAULT gen\_random\_uuid(),
-
-user\_id TEXT, -- nullable until auth wired
-
-question TEXT NOT NULL,
-
-answer TEXT,
-
-retrieved\_chunk\_ids UUID\[\],
-
-latency\_ms INTEGER,
-
-tokens\_used INTEGER,
-
-created\_at TIMESTAMPTZ NOT NULL DEFAULT now()
-
-);
-
-\-- 5. ingestion\_jobs — ETL state machine
-
-CREATE TABLE IF NOT EXISTS ingestion\_jobs (
-
-job\_id UUID PRIMARY KEY DEFAULT gen\_random\_uuid(),
-
-filing\_id UUID NOT NULL REFERENCES filings(filing\_id) ON DELETE CASCADE,
-
-status TEXT NOT NULL DEFAULT 'queued'
-
-CHECK (status IN ('queued', 'running', 'done', 'failed')),
-
-error TEXT,
-
-started\_at TIMESTAMPTZ,
-
-completed\_at TIMESTAMPTZ,
-
-created\_at TIMESTAMPTZ NOT NULL DEFAULT now()
-
-);
-
-\`\`\`
+-- financial_facts + entities: planned for v2 (XBRL → financial_facts; Apache AGE KG → entities); not created in v1.
+```
 
 \---
 
@@ -206,7 +140,7 @@ def seed\_companies(database\_url: str) -> int:
 
 \- Load \`DATABASE\_URL\` from \`.env\` via \`python-dotenv\`
 
-\- Use \`ON CONFLICT (ticker) DO UPDATE\` so script is idempotent (re-runnable)
+\- Use \`ON CONFLICT (cik) DO UPDATE\` so script is idempotent (re-runnable)
 
 \- Use \`executemany\` with a parameterized query (no f-string SQL — injection risk)
 
@@ -254,7 +188,7 @@ def seed\_companies(database\_url: str) -> int:
 
 6\. \`vector\` and \`pgcrypto\` extensions exist in DB
 
-7\. All 5 tables exist: \`companies\`, \`filings\`, \`chunks\`, \`queries\`, \`ingestion\_jobs\`
+7\. All 4 tables exist: \`companies\`, \`filings\`, \`chunks\`, \`ingestion\_jobs\`
 
 8\. \`chunks.embedding\` column type is \`vector(768)\`
 
@@ -264,7 +198,7 @@ def seed\_companies(database\_url: str) -> int:
 
 11\. GIN index \`idx\_chunks\_tsv\_gin\` exists on \`chunks.tsv\`
 
-12\. FK constraints present: \`filings.ticker → companies\`, \`chunks.filing\_id → filings\`, \`ingestion\_jobs.filing\_id → filings\`
+12\. FK constraints present: \`filings.cik → companies(cik)\`, \`chunks.filing\_id → filings(filing\_id)\`, \`ingestion\_jobs.filing\_id → filings(filing\_id)\`
 
 13\. Seed script populates exactly 10 rows in \`companies\`; re-running keeps it at 10
 
@@ -316,7 +250,7 @@ $PSQL "SELECT extname FROM pg\_extension WHERE extname IN ('vector','pgcrypto');
 
 echo "2. Tables..."
 
-for t in companies filings chunks queries ingestion\_jobs; do
+for t in companies filings chunks ingestion\_jobs; do
 
 $PSQL "SELECT to\_regclass('public.$t');" | grep -q "^$t$"
 
