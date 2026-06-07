@@ -1190,31 +1190,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw ON chunks
 CREATE INDEX IF NOT EXISTS idx_chunks_tsv ON chunks USING GIN (tsv);
 CREATE INDEX IF NOT EXISTS idx_chunks_filing_section ON chunks(filing_id, section);
 
--- financial_facts (empty in v1 — XBRL deferred to v2)
-CREATE TABLE IF NOT EXISTS financial_facts (
-    id BIGSERIAL PRIMARY KEY,
-    filing_id BIGINT REFERENCES filings(id) ON DELETE CASCADE,
-    concept VARCHAR(200) NOT NULL,
-    period_start DATE,
-    period_end DATE NOT NULL,
-    value NUMERIC(20, 4) NOT NULL,
-    unit VARCHAR(20),
-    decimals INT,
-    context_ref VARCHAR(100),
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_facts_concept_period ON financial_facts(concept, period_end DESC);
-
--- entities (empty stub for v2 KG — Apache AGE)
-CREATE TABLE IF NOT EXISTS entities (
-    id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    entity_type VARCHAR(50) NOT NULL,
-    cik VARCHAR(10) REFERENCES companies(cik),
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_entities_name_type ON entities(name, entity_type);
+-- financial_facts + entities: deferred to v2 (XBRL / Apache AGE KG); not created in v1.
 ```
 
 Run the schema:
@@ -1226,7 +1202,7 @@ psql "$NEON_DIRECT_URL" -f scripts/create_schema.sql
 
 [VERIFY]
 psql "$NEON_DIRECT_URL" -c "\dt"
-→ Shows: companies, filings, chunks, financial_facts, entities
+→ Shows: companies, filings, chunks, ingestion_jobs, queries
 
 psql "$NEON_DIRECT_URL" -c "\di" | grep hnsw
 → Shows: idx_chunks_embedding_hnsw
@@ -1449,7 +1425,7 @@ async def check_neon() -> None:
                 "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
             )
             table_names = {r["tablename"] for r in tables}
-            required = {"companies", "filings", "chunks", "financial_facts", "entities"}
+            required = {"companies", "filings", "chunks", "ingestion_jobs", "queries"}
             missing = required - table_names
             assert not missing, f"Missing tables: {missing}"
 
@@ -1632,7 +1608,7 @@ Phase 1 is complete when ALL of the following are true:
 - [ ] This setup guide in `docs/setup/`
 
 ### Database ✅
-- [ ] 5 tables created: companies, filings, chunks, financial_facts, entities
+- [ ] 5 tables created: companies, filings, chunks, ingestion_jobs, queries
 - [ ] pgvector extension enabled (`vector` extension version 0.7+)
 - [ ] HNSW index on `chunks.embedding VECTOR(768)` confirmed
 - [ ] GIN index on `chunks.tsv` confirmed

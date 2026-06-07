@@ -2,7 +2,7 @@
 
 \## Goal
 
-Bootstrap Neon Postgres with pgvector schema (4 tables, HNSW + GIN indexes) per v8 §6.1, seed 10 companies, and scaffold Claude Code context files (CLAUDE.md + PROJECT\_STATUS.md) per L23.
+Bootstrap Neon Postgres with pgvector schema (5 tables, HNSW + GIN indexes) per v8 §6.1, seed 10 companies, and scaffold Claude Code context files (CLAUDE.md + PROJECT\_STATUS.md) per L23.
 
 \## Files to Create
 
@@ -117,6 +117,29 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 5. queries — written by the agent's Synthesize node (query-side observability), NOT by ETL/seed; standalone, no FK.
+CREATE TABLE IF NOT EXISTS queries (
+    query_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             TEXT,
+    question            TEXT NOT NULL,
+    answer              TEXT,
+    retrieved_chunk_ids UUID[],
+    latency_ms          INT,
+    tokens_used         INT,
+    request_id          TEXT,
+    tickers             TEXT[],
+    intent              TEXT CHECK (intent IN ('comparative','temporal','factual','qualitative')),
+    confidence          TEXT CHECK (confidence IN ('low','high')),
+    status              TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','degraded','error')),
+    error               TEXT,
+    opik_trace_id       TEXT,
+    metadata            JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_queries_created  ON queries (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_queries_low_conf ON queries (created_at DESC) WHERE confidence = 'low';
+CREATE INDEX IF NOT EXISTS idx_queries_not_ok   ON queries (created_at DESC) WHERE status != 'ok';
+
 -- financial_facts + entities: planned for v2 (XBRL → financial_facts; Apache AGE KG → entities); not created in v1.
 ```
 
@@ -188,7 +211,7 @@ def seed\_companies(database\_url: str) -> int:
 
 6\. \`vector\` and \`pgcrypto\` extensions exist in DB
 
-7\. All 4 tables exist: \`companies\`, \`filings\`, \`chunks\`, \`ingestion\_jobs\`
+7\. All 5 tables exist: \`companies\`, \`filings\`, \`chunks\`, \`ingestion\_jobs\`, \`queries\`
 
 8\. \`chunks.embedding\` column type is \`vector(768)\`
 

@@ -314,6 +314,29 @@ CREATE TABLE ingestion_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 5. queries: query log written by the Synthesize node (query-side observability); no FK — a query spans many filings/chunks
+CREATE TABLE queries (
+    query_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             TEXT,
+    question            TEXT NOT NULL,
+    answer              TEXT,
+    retrieved_chunk_ids UUID[],
+    latency_ms          INT,
+    tokens_used         INT,
+    request_id          TEXT,
+    tickers             TEXT[],
+    intent              TEXT CHECK (intent IN ('comparative','temporal','factual','qualitative')),
+    confidence          TEXT CHECK (confidence IN ('low','high')),
+    status              TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','degraded','error')),
+    error               TEXT,
+    opik_trace_id       TEXT,
+    metadata            JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_queries_created  ON queries (created_at DESC);
+CREATE INDEX idx_queries_low_conf ON queries (created_at DESC) WHERE confidence = 'low';
+CREATE INDEX idx_queries_not_ok   ON queries (created_at DESC) WHERE status != 'ok';
+
 -- financial_facts + entities: planned for v2 (XBRL → financial_facts; Apache AGE KG → entities); not created in v1.
 ```
 
@@ -696,7 +719,7 @@ Numbered list. Each item is concrete and testable.
 | Spec | Title | Depends on | Notes |
 |---|---|---|---|
 | 01 | `01_settings.md` — pooled+direct DB URLs, R2 config, all env settings | — | |
-| 02 | `02_db_schema.md` — 4 tables (companies, filings, chunks, ingestion_jobs), HNSW `VECTOR(768)` + GIN indexes, Alembic baseline | 01 | |
+| 02 | `02_db_schema.md` — 5 tables (companies, filings, chunks, ingestion_jobs, queries), HNSW `VECTOR(768)` + GIN indexes, Alembic baseline | 01 | |
 | 03 | `03_edgar_client.md` — SEC API client with rate limiting | 01 | |
 | 04 | `04_section_detector.md` — parse 10-K/10-Q sections | 03 | |
 | 05 | `05_chunker.md` — token-aware, section-aware chunking | 04 | |

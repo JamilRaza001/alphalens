@@ -48,6 +48,7 @@ UNIQUE(filing_id, chunk_index). HNSW + GIN(tsv) indexes.
 | 6 | primary_doc_url | **LIVE (Option B).** Drop; derive EDGAR index URL from cik + accession_number | Don't denormalize a derivable value — store the fact (accession), build the URL on demand |
 | 7 | financial_facts / entities | **DEFER (Option B).** Do NOT create in v1; doc marks "planned v2" | v1 never reads them; expensive to populate (XBRL/KG); design finalizes in v2 — avoid speculative tables |
 | 8 | Renames batch | **LIVE (Option B).** Doc follows live names/types | Mechanical, no functional gain; working tested code on live; live's `TEXT` + explicit `*_id` are the better choices |
+| 9 | queries table | **KEPT in v1 (discovered live post-hoc).** Enhanced via additive ALTER with request_id, tickers, intent, confidence, status, error, opik_trace_id, metadata | Complements Opik, not duplicates. No FK — a query spans many filings/chunks. |
 
 Note: Locked architecture in `AlphaLens_v8.md` §3 (L1–L21) is unchanged. This reconcile corrects the doc's *description* (§6 schema, §8.2 state machine) to match reality — it is not an architecture change.
 
@@ -98,7 +99,7 @@ Indexes: keep `idx_filings_ticker_date(ticker, filing_date DESC)`; add an index 
 3. companies add `sic_code` + `fiscal_year_end` (#5).
 
 **Doc-only (`AlphaLens_v8.md` — live already matches):**
-- §6 → 4 live tables, cik-PK, step column, drop primary_doc_url (#6), mark financial_facts/entities "planned v2" (#7), live names/types (#8).
+- §6 → 5 live tables (companies, filings, chunks, ingestion_jobs, queries), cik-PK, step column, drop primary_doc_url (#6), mark financial_facts/entities "planned v2" (#7), live names/types (#8), queries table (#9).
 - §8.2 → two-level state machine + retry-by-COUNT + app-level backoff (#1/#2/#3).
 - §1 → history line `v8.1 patch`.
 - grep-fix stale tokens: `state='indexed'` → `status='processed'`, `form_type` → `filing_type`, `period_of_report` → `period_end`, `r2_html_key` → `r2_key`, `id` → `filing_id`/`chunk_id`, VARCHAR → TEXT.
