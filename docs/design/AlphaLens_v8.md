@@ -58,14 +58,15 @@
 | v5.1 patch | (prior) | DB → Neon, Compute → Lambda (full), Storage → R2 |
 | v6 | (prior) | Full consolidated design — superseded v5 + patch |
 | v7 | (prior) | Master doc: consolidates v6 + honest cost reality + Pakistan operational notes + $100 AWS credits constraint + project status tracker. Superseded v6. |
-| **v8 (current)** | May 1, 2026 | Design Review Session 2: 7 locked changes applied (see below). Supersedes v7. |
+| v8 | May 1, 2026 | Design Review Session 2: 7 locked changes applied (see below). Supersedes v7. |
+| **v8.1 patch (current)** | Jun 7, 2026 | Schema & state machine reconciled to live (decisions #1–#8); §6 + §8.2 corrected; §3 unchanged. |
 
 ### What's New in v8 vs v7
 
 1. **Change #1 (locked in Session 1):** Reranker Lambda merged into Agent Lambda. Single container, in-process call. `L14` superseded.
 2. **Change #2 (locked in Session 1):** Auth changed from SigV4 to Vercel OIDC. Lambda URL `auth=NONE` (public). FastAPI middleware verifies `VERCEL_OIDC_TOKEN` via PyJWT + PyJWKClient. `L11` superseded.
 3. **Change #3:** 7 LangGraph nodes → 5 nodes. New graph: `Plan → Retrieve+Filter → Rerank → Evaluate → Synthesize`. Filter folded into Retrieve. Refine node deferred to v3. RAG classification: Single-Pass Agentic RAG.
-4. **Change #4:** XBRL parser (spec 09) deferred entirely from Phase 1 to v2. `financial_facts` table stays in schema (empty). `entities` table stub added for v2 KG prep.
+4. **Change #4:** XBRL parser (spec 09) deferred entirely from Phase 1 to v2. `financial_facts` and `entities` tables deferred to v2 (not created in v1; see §6).
 5. **Change #5:** O1 resolved — Jina embedding dimensions locked at **768d**. `VECTOR(768)` across all 4 touchpoints. Nomic fallback native 768d alignment confirmed.
 6. **Change #6:** Nomic fallback (`nomic-embed-text-v1.5`) built in **Spec 06** alongside Jina (not deferred). Jina free tier ~1M tokens → ~2 month runway at current query volume; fallback built proactively.
 7. **Change #7:** Spec format locked at **lightweight** — Goal + Function Signatures + Acceptance Criteria + Gotchas (optional). ~1 page per spec. 18 pages total vs 90 pages full format.
@@ -253,80 +254,67 @@ Note: Evaluate → Refine → Retrieve retry cycle is v3.
 ```sql
 -- companies: 10 rows (top S&P 500)
 CREATE TABLE companies (
-    cik VARCHAR(10) PRIMARY KEY,         -- Central Index Key (zero-padded)
-    ticker VARCHAR(10) NOT NULL UNIQUE,
-    name VARCHAR(255) NOT NULL,
-    sic_code VARCHAR(4),                 -- Industry classification
-    fiscal_year_end VARCHAR(4),          -- 'MMDD' format e.g. '0930' for Apple
-    created_at TIMESTAMPTZ DEFAULT now()
+    cik TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    sector TEXT,
+    sic_code TEXT,
+    fiscal_year_end TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- filings: ~200 rows
 CREATE TABLE filings (
-    id BIGSERIAL PRIMARY KEY,
-    cik VARCHAR(10) REFERENCES companies(cik),
-    accession_number VARCHAR(20) UNIQUE NOT NULL,  -- SEC's globally unique ID
-    form_type VARCHAR(10) NOT NULL,                -- '10-K' | '10-Q'
+    filing_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cik TEXT NOT NULL REFERENCES companies(cik) ON DELETE CASCADE,
+    ticker TEXT NOT NULL,                          -- convenience column; cik is the FK (decision #4)
+    filing_type TEXT NOT NULL CHECK (filing_type IN ('10-K', '10-Q')),
     filing_date DATE NOT NULL,
-    period_of_report DATE NOT NULL,
-    primary_doc_url TEXT NOT NULL,
-    r2_html_key TEXT,                              -- R2 cache key
-    state VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending|downloading|parsing|chunking|embedding|indexed|failed
-    state_updated_at TIMESTAMPTZ DEFAULT now(),
-    error_message TEXT,
-    retry_count INT DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT now()
+    period_end DATE NOT NULL,
+    accession_number TEXT NOT NULL UNIQUE,
+    r2_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'processed', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX idx_filings_cik_period ON filings(cik, period_of_report DESC);
-CREATE INDEX idx_filings_state ON filings(state) WHERE state != 'indexed';
+CREATE INDEX idx_filings_cik_date ON filings(cik, filing_date DESC);
+CREATE INDEX idx_filings_ticker_date ON filings(ticker, filing_date DESC);
 
 -- chunks: ~22,000 rows
 CREATE TABLE chunks (
-    id BIGSERIAL PRIMARY KEY,
-    filing_id BIGINT REFERENCES filings(id) ON DELETE CASCADE,
-    section VARCHAR(100) NOT NULL,
-    section_order INT NOT NULL,
+    chunk_id UUID PRIMARY KEY,
+    filing_id UUID NOT NULL REFERENCES filings(filing_id) ON DELETE CASCADE,
     chunk_index INT NOT NULL,
-    text TEXT NOT NULL,
-    token_count INT NOT NULL,
-    embedding VECTOR(768),                         -- Locked: 768d (L17). Jina truncate_dim=768 or nomic native 768d
-    embedding_model_version VARCHAR(50) NOT NULL,  -- 'jina-v3' | 'nomic-embed-text-v1.5'
-    tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now()
+    section TEXT,
+    section_order INT NOT NULL DEFAULT 0,
+    text TEXT,
+    token_count INT,
+    embedding VECTOR(768),                          -- Locked: 768d (L17). Jina truncate_dim=768 or nomic native 768d
+    embedding_model_version TEXT,                   -- 'jina-v3' | 'nomic-embed-text-v1.5'
+    metadata JSONB NOT NULL DEFAULT '{}',
+    tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', coalesce(text, ''))) STORED,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (filing_id, chunk_index)
 );
 CREATE INDEX idx_chunks_embedding_hnsw ON chunks
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 CREATE INDEX idx_chunks_tsv ON chunks USING GIN (tsv);
-CREATE INDEX idx_chunks_filing_section ON chunks(filing_id, section);
 
--- financial_facts: schema present, empty in v1 (XBRL parser deferred to v2)
-CREATE TABLE financial_facts (
-    id BIGSERIAL PRIMARY KEY,
-    filing_id BIGINT REFERENCES filings(id) ON DELETE CASCADE,
-    concept VARCHAR(200) NOT NULL,         -- e.g., 'us-gaap:Revenues'
-    period_start DATE,
-    period_end DATE NOT NULL,
-    value NUMERIC(20, 4) NOT NULL,
-    unit VARCHAR(20),
-    decimals INT,
-    context_ref VARCHAR(100),
-    created_at TIMESTAMPTZ DEFAULT now()
+-- ingestion_jobs: per-attempt audit trail (see §8.2)
+CREATE TABLE ingestion_jobs (
+    job_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    filing_id UUID NOT NULL REFERENCES filings(filing_id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'done', 'failed')),
+    step TEXT CHECK (step IN ('download', 'parse', 'chunk', 'embed', 'upsert')),  -- nullable; set on entry to each stage
+    error TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX idx_facts_concept_period ON financial_facts(concept, period_end DESC);
 
--- entities: schema stub for v2 KG (Apache AGE). Empty in v1.
--- Populated by entity extraction at ingestion time in v2.
-CREATE TABLE entities (
-    id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    entity_type VARCHAR(50) NOT NULL,      -- 'company' | 'person' | 'metric' | 'product'
-    cik VARCHAR(10) REFERENCES companies(cik),
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX idx_entities_name_type ON entities(name, entity_type);
+-- financial_facts + entities: planned for v2 (XBRL → financial_facts; Apache AGE KG → entities); not created in v1.
 ```
 
 ### 6.2 Storage Math
@@ -427,15 +415,33 @@ class GroqCircuitBreaker:
 EDGAR API → Filing Metadata → R2 Cache (HTML) →
   → Section Detector → Chunker →
   → Embedding (Jina v3 primary | nomic-embed-text-v1.5 fallback) →
-  → Neon Upsert → state='indexed'
+  → Neon Upsert → status='processed'
 ```
 
 ### 8.2 Filing State Machine
 
 ```
-pending → downloading → parsing → chunking → embedding → indexed
-                  ↓
-                failed (retry up to 3 times with exponential backoff)
+Two-level state model:
+
+Coarse lifecycle — filings.status:
+  pending → processing → processed
+                ↓
+              failed   (retries exhausted — COUNT(ingestion_jobs) >= 3)
+
+Per-attempt — ingestion_jobs.status:
+  queued → running → done
+                ↓
+              failed   (this attempt failed; filing may retry)
+
+Retry (derived, not stored):
+  attempt_count = SELECT COUNT(*) FROM ingestion_jobs WHERE filing_id = $1
+  max_attempts  = 3  (retry while COUNT < 3)
+  backoff       = computed app-level from last failed job's completed_at + attempt number
+  No retry_count or next_attempt_at columns — job rows are the single source of truth.
+
+Two retry layers:
+  inner — tenacity on flaky API/network calls within one attempt
+  outer — filing-level: new ingestion_jobs row per retry, up to 3 total, exponential backoff
 ```
 
 ### 8.3 Chunking Strategy
@@ -690,7 +696,7 @@ Numbered list. Each item is concrete and testable.
 | Spec | Title | Depends on | Notes |
 |---|---|---|---|
 | 01 | `01_settings.md` — pooled+direct DB URLs, R2 config, all env settings | — | |
-| 02 | `02_db_schema.md` — 5 tables (incl. entities stub), HNSW `VECTOR(768)` + GIN indexes, Alembic baseline | 01 | |
+| 02 | `02_db_schema.md` — 4 tables (companies, filings, chunks, ingestion_jobs), HNSW `VECTOR(768)` + GIN indexes, Alembic baseline | 01 | |
 | 03 | `03_edgar_client.md` — SEC API client with rate limiting | 01 | |
 | 04 | `04_section_detector.md` — parse 10-K/10-Q sections | 03 | |
 | 05 | `05_chunker.md` — token-aware, section-aware chunking | 04 | |
@@ -725,7 +731,7 @@ Numbered list. Each item is concrete and testable.
 
 - All 17 specs authored, reviewed, committed
 - All implementations pass per-spec acceptance criteria
-- ETL pipeline ingests all ~200 filings end-to-end with state='indexed' for ≥95%
+- ETL pipeline ingests all ~200 filings end-to-end with status='processed' for ≥95%
 - Agent answers 10 sample queries from golden dataset with citations
 - E2E latency on warm Lambda ≤15s for 95th percentile
 - Deployed to production (Lambda + Vercel), Function URL accessible, frontend loads
