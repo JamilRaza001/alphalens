@@ -377,14 +377,15 @@ async def test_integration_upsert_round_trip() -> None:
         )
         filing_id: UUID = await conn.fetchval(
             "INSERT INTO filings"
-            " (ticker, filing_type, filing_date, period_end, accession_number, r2_key)"
-            " VALUES ($1, $2, $3, $4, $5, $6) RETURNING filing_id",
+            " (ticker, filing_type, filing_date, period_end, accession_number, r2_key,cik)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING filing_id",
             "__S9TEST__",
             "10-K",
             date(2024, 1, 1),
             date(2023, 12, 31),
             "9999999999-24-000001",
             "test/s9/integration",
+            "9999999999",
         )
         assert filing_id is not None
 
