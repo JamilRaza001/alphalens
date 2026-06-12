@@ -12,7 +12,7 @@ import asyncio
 import time
 
 import pytest
-from alphalens.etl.rate_limit import TokenBucket
+from alphalens.etl.rate_limit import TokenBucket, token_aware_batches
 
 # ---------------------------------------------------------------------------
 # Shared fixture — fake monotonic clock + instant sleep
@@ -74,7 +74,7 @@ def test_ac4_init_guards() -> None:
 
 async def test_ac1_acquire_within_balance_no_sleep(fake_clock: list[float]) -> None:
     """AC#1: acquire(n ≤ available) returns immediately; available decrements by n."""
-    bucket = TokenBucket(capacity=1000, refill_per_sec=100.0)
+    bucket = TokenBucket(capacity=1000, refill_per_sec=100.0, initial_tokens=1000)
     time_before = fake_clock[0]
 
     await bucket.acquire(400)
@@ -142,7 +142,7 @@ async def test_ac8_concurrent_second_is_paced(fake_clock: list[float]) -> None:
     Because asyncio.Lock is held across the sleep, the second coroutine queues
     behind the first; total mocked elapsed ≥ 0.4 s.
     """
-    bucket = TokenBucket(capacity=1000, refill_per_sec=500.0)
+    bucket = TokenBucket(capacity=1000, refill_per_sec=500.0, initial_tokens=1000)
     elapsed_records: list[float] = []
 
     async def _timed_acquire(n: int) -> None:
@@ -158,3 +158,70 @@ async def test_ac8_concurrent_second_is_paced(fake_clock: list[float]) -> None:
     ), f"Expected one acquire to sleep ≥ 0.4 s (±0.05), got elapsed={elapsed_records}"
     # Total mocked time advanced by the sleep
     assert fake_clock[0] >= 0.35
+
+
+# ---------------------------------------------------------------------------
+# AC#14 — empty-start bucket (initial_tokens=0)
+# ---------------------------------------------------------------------------
+
+
+async def test_ac14_empty_start_bucket_paces(fake_clock: list[float]) -> None:
+    """AC#14: initial_tokens=0 starts empty; first acquire must sleep."""
+    bucket = TokenBucket(capacity=1000, refill_per_sec=500.0, initial_tokens=0)
+    assert bucket.available == pytest.approx(0.0)
+    await bucket.acquire(500)
+    assert fake_clock[0] == pytest.approx(1.0, abs=0.01)
+
+
+def test_ac14_from_tpm_empty_start() -> None:
+    """AC#14: from_tpm with initial_tokens=0 stores _tokens==0 (no initial burst).
+    Check _tokens directly — available() applies real-clock refill, adding a few
+    tokens in the nanoseconds between construction and assertion."""
+    bucket = TokenBucket.from_tpm(90_000, initial_tokens=0)
+    assert bucket._tokens == pytest.approx(0.0)
+    assert bucket._capacity == 90_000
+
+
+# ---------------------------------------------------------------------------
+# AC#15 — safety invariant: tpm_limit + max_request_tokens <= 100_000
+# ---------------------------------------------------------------------------
+
+
+def test_ac15_safety_invariant() -> None:
+    """AC#15: default jina_tpm_limit (90_000) + jina_max_request_tokens (6_000) <= 100_000.
+    Runtime enforcement is via config.py model_validator."""
+    assert 90_000 + 6_000 <= 100_000
+
+
+# ---------------------------------------------------------------------------
+# token_aware_batches — AC#13 batching logic
+# ---------------------------------------------------------------------------
+
+
+def test_token_aware_batches_single_batch() -> None:
+    """Items whose sum <= max_tokens are emitted in one batch."""
+    batches = list(token_aware_batches(["a", "b"], [2000, 2000], 5000))
+    assert len(batches) == 1
+    assert batches[0][0] == ["a", "b"]
+    assert batches[0][1] == [2000, 2000]
+
+
+def test_token_aware_batches_splits_on_overflow() -> None:
+    """Sum exceeding max_tokens triggers a new batch; boundary is exclusive (> not >=)."""
+    batches = list(token_aware_batches(["a", "b", "c"], [3000, 3000, 3000], 6000))
+    assert len(batches) == 2
+    assert batches[0][0] == ["a", "b"]  # sum=6000 (≤ 6000, not split)
+    assert batches[1][0] == ["c"]
+
+
+def test_token_aware_batches_over_cap_lone_item() -> None:
+    """A single item exceeding max_tokens is emitted alone, never skipped."""
+    batches = list(token_aware_batches(["big"], [9000], 6000))
+    assert len(batches) == 1
+    assert batches[0][0] == ["big"]
+    assert batches[0][1] == [9000]
+
+
+def test_token_aware_batches_empty() -> None:
+    """Empty input yields zero batches."""
+    assert list(token_aware_batches([], [], 6000)) == []

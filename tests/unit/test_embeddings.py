@@ -59,6 +59,7 @@ def _make_settings(batch_size: int = 128) -> MagicMock:
     s.nomic_model = "nomic-ai/nomic-embed-text-v1.5"
     s.embedding_batch_size = batch_size
     s.jina_api_key.get_secret_value.return_value = "fake-key"
+    s.jina_max_request_tokens = 6_000
     return s
 
 
@@ -136,10 +137,10 @@ async def test_ac3_order_preserved_across_batches() -> None:
             },
         )
 
-    # batch_size=2, 5 texts → 3 batches: [0,1], [2,3], [4]
-    client = _make_client(jina_handler=ordered_handler, batch_size=2)
+    # 5 texts, token_counts=3000 each, jina_max_request_tokens=6000 → 3 batches: [0,1], [2,3], [4]
+    client = _make_client(jina_handler=ordered_handler)
     texts = ["t0", "t1", "t2", "t3", "t4"]
-    result = await client.embed_documents(texts)
+    result = await client.embed_documents(texts, token_counts=[3000] * 5)
 
     assert len(result.vectors) == 5
     # Each batch resets index to 0 — so vectors[0]==0.0, [1]==1.0, [2]==0.0, [3]==1.0, [4]==0.0
@@ -162,9 +163,15 @@ async def test_ac4_batching_splits_and_concatenates() -> None:
         call_count += 1
         return _fake_jina_handler(request)
 
-    client = _make_client(jina_handler=counting_handler, batch_size=2)
-    texts = ["a", "b", "c", "d", "e"]  # 5 texts, batch_size=2 → 3 batches
-    result = await client.embed_documents(texts)
+    client = _make_client(jina_handler=counting_handler)
+    texts = [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+    ]  # 5 texts, token_counts=3000 each, max_request_tokens=6000 → 3 batches
+    result = await client.embed_documents(texts, token_counts=[3000] * 5)
 
     assert call_count == 3, f"expected 3 Jina calls, got {call_count}"
     assert len(result.vectors) == 5
@@ -351,7 +358,8 @@ async def test_ac10_retry_on_429() -> None:
 async def test_ac10_402_flips_to_nomic() -> None:
     """AC#10 + FIX 1: 402 on batch 2 → discard all Jina vectors, re-embed entire input via nomic.
 
-    Setup: batch_size=2, 3 texts → batch 1 succeeds (200), batch 2 returns 402.
+    Setup: 3 texts, token_counts=3000 each, jina_max_request_tokens=6000
+    → batch 1=[t0,t1] succeeds (200), batch 2=[t2] returns 402.
     Assert:
       - Final result has model_version='nomic-embed-text-v1.5'
       - ALL 3 vectors equal the nomic sentinel (0.5), none equal the Jina sentinel (0.1)
@@ -369,9 +377,8 @@ async def test_ac10_402_flips_to_nomic() -> None:
     client = _make_client(
         jina_handler=quota_on_second_batch,
         nomic_encode=fake_nomic_encode,
-        batch_size=2,
     )
-    result = await client.embed_documents(["t0", "t1", "t2"])
+    result = await client.embed_documents(["t0", "t1", "t2"], token_counts=[3000, 3000, 3000])
 
     assert (
         result.model_version == "nomic-embed-text-v1.5"
@@ -499,6 +506,40 @@ async def test_ac14_aclose_injected_not_closed() -> None:
     # Injected client should still be usable (not closed)
     assert not injected.is_closed, "aclose() must not close an injected http_client"
     await injected.aclose()  # cleanup
+
+
+# ---------------------------------------------------------------------------
+# Spec 06a AC#13 — token-aware batching caps each Jina request
+# ---------------------------------------------------------------------------
+
+
+async def test_spec06a_ac13_token_aware_batching_limits_request_size() -> None:
+    """Spec 06a AC#13: no Jina request body has summed token_count > jina_max_request_tokens."""
+    captured_inputs: list[list[str]] = []
+
+    def capture_handler(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, Any] = json.loads(request.content)
+        captured_inputs.append(payload["input"])
+        return _fake_jina_handler(request)
+
+    settings = _make_settings()
+    settings.jina_max_request_tokens = 5_000
+    transport = httpx.MockTransport(capture_handler)
+    http_client = httpx.AsyncClient(transport=transport)
+    test_bucket = TokenBucket(capacity=10_000_000, refill_per_sec=10_000_000)
+    client = EmbeddingClient(settings, http_client=http_client, bucket=test_bucket)
+
+    texts = ["text_a", "text_b", "text_c", "text_d"]
+    token_counts = [2000, 2000, 2000, 2000]  # naive single-batch sum=8000 > 5000
+    tc_map = dict(zip(texts, token_counts, strict=True))
+
+    result = await client.embed_documents(texts, token_counts=token_counts)
+
+    assert len(result.vectors) == 4
+    assert len(captured_inputs) >= 2, f"expected multiple batches, got {len(captured_inputs)}"
+    for batch_inputs in captured_inputs:
+        batch_sum = sum(tc_map[t] for t in batch_inputs)
+        assert batch_sum <= 5_000, f"request exceeded cap: sum={batch_sum}, inputs={batch_inputs}"
 
 
 # ---------------------------------------------------------------------------

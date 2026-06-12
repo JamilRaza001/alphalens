@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     jina_dimensions: int = 768  # locked at 768 — see _lock_jina_dimensions
     jina_free_tier_tokens: int = 10_000_000
     jina_tpm_limit: int = 90_000  # 90% of Jina's 100K TPM hard cap; env: JINA_TPM_LIMIT
+    jina_max_request_tokens: int = (
+        6_000  # max summed tokens per Jina request; env: JINA_MAX_REQUEST_TOKENS
+    )
 
     # ── Embeddings — nomic fallback (L18) ─────────────────────────────────────
     nomic_model: str = "nomic-ai/nomic-embed-text-v1.5"
@@ -117,6 +120,17 @@ class Settings(BaseSettings):
                 "pgvector schema is VECTOR(768) — see locked decision L17"
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_tpm_safety_invariant(self) -> Settings:
+        """Enforce AC#15: worst-case window = jina_tpm_limit + one request <= 100_000."""
+        if self.jina_tpm_limit + self.jina_max_request_tokens > 100_000:
+            raise ValueError(
+                f"jina_tpm_limit ({self.jina_tpm_limit}) + jina_max_request_tokens "
+                f"({self.jina_max_request_tokens}) must be <= 100_000 "
+                "(Jina rolling window safety invariant)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_oidc_in_lambda(self) -> Settings:

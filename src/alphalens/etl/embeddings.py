@@ -22,7 +22,7 @@ from tenacity import (
 )
 
 from alphalens.config import Settings, get_settings
-from alphalens.etl.rate_limit import TokenBucket, get_jina_bucket
+from alphalens.etl.rate_limit import TokenBucket, get_jina_bucket, token_aware_batches
 
 _log = logging.getLogger(__name__)
 
@@ -284,12 +284,18 @@ class EmbeddingClient:
             jina_vectors: list[list[float]] = []
             call_tokens = 0
             bucket = self._bucket or get_jina_bucket()
+            # Resolve token_counts upfront — needed by token_aware_batches.
+            if token_counts is None:
+                from alphalens.etl.chunker import default_token_counter
+
+                _count = default_token_counter()
+                resolved_tc: list[int] = [_count(t) for t in texts]
+            else:
+                resolved_tc = list(token_counts)
             try:
-                for i in range(0, len(texts), batch_size):
-                    batch = texts[i : i + batch_size]
-                    batch_tc = (
-                        token_counts[i : i + batch_size] if token_counts is not None else None
-                    )
+                for batch, batch_tc in token_aware_batches(
+                    texts, resolved_tc, self._settings.jina_max_request_tokens
+                ):
                     vecs, tok = await _jina_paced(
                         batch,
                         batch_tc,
