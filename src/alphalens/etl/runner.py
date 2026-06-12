@@ -227,7 +227,10 @@ async def _process_one(filing_id: UUID, *, settings: Settings, pool: asyncpg.Poo
             await record_step(conn, job_id, IngestionStep.EMBED)
         embedder = EmbeddingClient(settings)
         try:
-            embeddings = await embedder.embed_documents([c.text for c in chunks])
+            embeddings = await embedder.embed_documents(
+                [c.text for c in chunks],
+                token_counts=[c.token_count for c in chunks],
+            )
         finally:
             await embedder.aclose()
 

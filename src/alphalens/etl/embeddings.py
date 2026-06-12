@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 import httpx
@@ -21,11 +21,13 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from alphalens.config import Settings
+from alphalens.config import Settings, get_settings
+from alphalens.etl.rate_limit import TokenBucket, get_jina_bucket
 
 _log = logging.getLogger(__name__)
 
 _nomic_model: Any = None  # module-level lazy-load sentinel (SentenceTransformer)
+_JINA_HTTP: httpx.AsyncClient | None = None  # module-level singleton for direct jina_embed calls
 
 # ---------------------------------------------------------------------------
 # Public type aliases
@@ -84,6 +86,119 @@ def default_nomic_encoder(model_name: str) -> NomicEncoder:
 
 
 # ---------------------------------------------------------------------------
+# Module-level Jina HTTP helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_jina_http() -> httpx.AsyncClient:
+    """Lazy module-level httpx singleton for direct jina_embed() calls.
+
+    No explicit close/lifecycle — prod always injects self._http from EmbeddingClient.
+    This fallback is only reached when jina_embed() is called outside the client.
+    """
+    global _JINA_HTTP
+    if _JINA_HTTP is None:
+        _JINA_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+    return _JINA_HTTP
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_jina),
+    wait=wait_exponential_jitter(initial=1, max=30),
+    stop=stop_after_attempt(5),
+    reraise=True,
+)
+async def _jina_post(
+    texts: list[str],
+    *,
+    task: str,
+    http: httpx.AsyncClient,
+    settings: Settings,
+) -> tuple[list[list[float]], int]:
+    """POST to Jina v3 API; tenacity retries 429/5xx up to 5x; 402 propagates immediately.
+
+    Returns (vectors, usage.total_tokens) — authoritative token count from Jina's response.
+    """
+    r = await http.post(
+        "https://api.jina.ai/v1/embeddings",
+        headers={"Authorization": f"Bearer {settings.jina_api_key.get_secret_value()}"},
+        json={
+            "model": settings.jina_model,
+            "input": texts,
+            "dimensions": settings.jina_dimensions,
+            "task": task,
+        },
+    )
+    try:
+        r.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise httpx.HTTPStatusError(
+            f"{exc} — body: {r.text}",
+            request=exc.request,
+            response=exc.response,
+        ) from exc
+    body: dict[str, Any] = r.json()
+    # Sort by per-item index — real Jina API does not guarantee response order
+    items = sorted(body["data"], key=lambda d: d["index"])
+    vectors: list[list[float]] = [item["embedding"] for item in items]
+    tokens: int = body["usage"]["total_tokens"]
+    return vectors, tokens
+
+
+async def _jina_paced(
+    texts: list[str],
+    token_counts: Sequence[int] | None,
+    *,
+    task: str,
+    bucket: TokenBucket,
+    http: httpx.AsyncClient,
+    settings: Settings,
+) -> tuple[list[list[float]], int]:
+    """Acquire bucket tokens exactly once, then delegate to _jina_post.
+
+    Returns (vectors, reported_tokens) so callers can accumulate authoritative
+    Jina usage counts without re-tokenizing.
+    """
+    if token_counts is None:
+        from alphalens.etl.chunker import default_token_counter
+
+        _count = default_token_counter()
+        resolved_tc: list[int] = [_count(t) for t in texts]
+    else:
+        resolved_tc = list(token_counts)
+    await bucket.acquire(sum(resolved_tc))
+    return await _jina_post(texts, task=task, http=http, settings=settings)
+
+
+async def jina_embed(
+    texts: list[str],
+    token_counts: Sequence[int] | None = None,
+    *,
+    task: str = "retrieval.passage",
+    bucket: TokenBucket | None = None,
+    _http: httpx.AsyncClient | None = None,
+) -> list[list[float]]:
+    """Embed via Jina v3 (truncate_dim=768), pacing through the token bucket.
+
+    Acquires bucket tokens exactly once before the HTTP call. token_counts defaults
+    to the project's existing token-count utility (same as chunker). bucket defaults
+    to the process-wide get_jina_bucket() singleton.
+    task: "retrieval.passage" for document chunks, "retrieval.query" for search queries.
+    _http: test injection seam only — omit in production.
+    """
+    _bucket = bucket or get_jina_bucket()
+    vecs, _ = await _jina_paced(
+        texts,
+        token_counts,
+        task=task,
+        bucket=_bucket,
+        http=_http or _get_jina_http(),
+        settings=get_settings(),
+    )
+    return vecs
+
+
+# ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
 
@@ -96,6 +211,7 @@ class EmbeddingClient:
         http_client: httpx.AsyncClient | None = None,
         nomic_encode: NomicEncoder | None = None,
         force_fallback: bool = False,
+        bucket: TokenBucket | None = None,
     ) -> None:
         self._settings = settings
         self._own_http = http_client is None
@@ -106,14 +222,22 @@ class EmbeddingClient:
         self._force_fallback = force_fallback
         self._total_tokens: int = 0
         self._quota_exceeded: bool = False
+        self._bucket = bucket  # None → resolved lazily via get_jina_bucket() in _embed
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def embed_documents(self, texts: list[str]) -> EmbeddingResult:
+    async def embed_documents(
+        self, texts: list[str], *, token_counts: list[int] | None = None
+    ) -> EmbeddingResult:
         """Embed ingestion chunks (Jina task=retrieval.passage / nomic prefix 'search_document: ')."""
-        return await self._embed(texts, task="retrieval.passage", prefix="search_document: ")
+        return await self._embed(
+            texts,
+            task="retrieval.passage",
+            prefix="search_document: ",
+            token_counts=token_counts,
+        )
 
     async def embed_query(self, text: str) -> EmbeddingResult:
         """Embed one search query (Jina task=retrieval.query / nomic prefix 'search_query: ')."""
@@ -140,7 +264,14 @@ class EmbeddingClient:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _embed(self, texts: list[str], *, task: str, prefix: str) -> EmbeddingResult:
+    async def _embed(
+        self,
+        texts: list[str],
+        *,
+        task: str,
+        prefix: str,
+        token_counts: list[int] | None = None,
+    ) -> EmbeddingResult:
         """Route to Jina or nomic; batch; return a homogeneous EmbeddingResult."""
         if not texts:
             # AC#12: empty input — no HTTP call, no encode
@@ -152,11 +283,23 @@ class EmbeddingClient:
         if use_jina:
             jina_vectors: list[list[float]] = []
             call_tokens = 0
+            bucket = self._bucket or get_jina_bucket()
             try:
                 for i in range(0, len(texts), batch_size):
-                    vecs, tok = await self._jina_embed(texts[i : i + batch_size], task=task)
+                    batch = texts[i : i + batch_size]
+                    batch_tc = (
+                        token_counts[i : i + batch_size] if token_counts is not None else None
+                    )
+                    vecs, tok = await _jina_paced(
+                        batch,
+                        batch_tc,
+                        task=task,
+                        bucket=bucket,
+                        http=self._http,
+                        settings=self._settings,
+                    )
                     jina_vectors.extend(vecs)
-                    call_tokens += tok
+                    call_tokens += tok  # authoritative Jina-reported tokens
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 402:
                     # FIX 1: discard all collected Jina vectors; re-embed entire input via nomic.
@@ -186,39 +329,6 @@ class EmbeddingClient:
             model_version="nomic-embed-text-v1.5",
             tokens_used=0,
         )
-
-    @retry(
-        retry=retry_if_exception(_is_retryable_jina),
-        wait=wait_exponential_jitter(initial=1, max=30),
-        stop=stop_after_attempt(5),
-        reraise=True,
-    )
-    async def _jina_embed(self, texts: list[str], *, task: str) -> tuple[list[list[float]], int]:
-        """POST to Jina v3 API; tenacity retries 429/5xx up to 5x; 402 propagates immediately."""
-        r = await self._http.post(
-            "https://api.jina.ai/v1/embeddings",
-            headers={"Authorization": f"Bearer {self._settings.jina_api_key.get_secret_value()}"},
-            json={
-                "model": self._settings.jina_model,
-                "input": texts,
-                "dimensions": self._settings.jina_dimensions,
-                "task": task,
-            },
-        )
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise httpx.HTTPStatusError(
-                f"{exc} — body: {r.text}",
-                request=exc.request,
-                response=exc.response,
-            ) from exc
-        body: dict[str, Any] = r.json()
-        # FIX 3: sort by per-item index — real Jina API does not guarantee response order
-        items = sorted(body["data"], key=lambda d: d["index"])
-        vectors: list[list[float]] = [item["embedding"] for item in items]
-        tokens: int = body["usage"]["total_tokens"]
-        return vectors, tokens
 
     def _get_nomic_encoder(self) -> NomicEncoder:
         """Lazy-load nomic encoder on first fallback call; return injected encoder immediately."""

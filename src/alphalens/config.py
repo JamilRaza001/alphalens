@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     jina_model: str = "jina-embeddings-v3"
     jina_dimensions: int = 768  # locked at 768 — see _lock_jina_dimensions
     jina_free_tier_tokens: int = 10_000_000
+    jina_tpm_limit: int = 90_000  # 90% of Jina's 100K TPM hard cap; env: JINA_TPM_LIMIT
 
     # ── Embeddings — nomic fallback (L18) ─────────────────────────────────────
     nomic_model: str = "nomic-ai/nomic-embed-text-v1.5"

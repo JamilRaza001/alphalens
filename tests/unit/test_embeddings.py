@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 from alphalens.etl.embeddings import EmbeddingClient, EmbeddingResult
+from alphalens.etl.rate_limit import TokenBucket
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -71,11 +72,15 @@ def _make_client(
     settings = _make_settings(batch_size=batch_size)
     transport = httpx.MockTransport(jina_handler)
     http_client = httpx.AsyncClient(transport=transport)
+    # Inject a per-test bucket so existing tests never touch the module-level
+    # singleton and remain isolated across event loops.
+    test_bucket = TokenBucket(capacity=10_000_000, refill_per_sec=10_000_000)
     return EmbeddingClient(
         settings,
         http_client=http_client,
         nomic_encode=nomic_encode,
         force_fallback=force_fallback,
+        bucket=test_bucket,
     )
 
 
