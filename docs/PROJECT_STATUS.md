@@ -11,3 +11,17 @@
 | S9 | Upsert Pipeline | DONE | `caefd23` | EmbeddedChunk assembly (count + 768d check, global re-index, per-section idx in metadata, model stamp) + idempotent batched upsert (ON CONFLICT filing_id,chunk_index) + mixed-model + corpus guards; pgvector codec + JSONB; 15 unit + 1 real-Neon integration |
 | S10 | Filing State Machine | DONE | `720a7bd` | FilingStatus/JobStatus/IngestionStep StrEnums; MAX_ATTEMPTS=3; COUNT-based retry (no retry_count col); app-side exponential backoff 2/4/8s; claim_retryable_filings two-query + Python filter; caller-owned transactions; 12 unit + 1 real-Neon integration test |
 | Doc | Schema Reconcile — queries as 5th table | DONE | `7d065cb` | queries DDL added to §6.1 + S2 spec + Phase1 guide; financial_facts/entities correctly marked v2-deferred everywhere; decision #9 locked in schema_reconcile_to_live.md |
+
+## Phase 1 ETL Backfill
+
+**Status: 151/151 = 100% processed** (verified 2026-06-13). Zero pending/processing/failed.
+
+- Last 3 (JPM iXBRL filings) closed in S20 via empty-start token bucket + token-aware batching (≤6K tok/req).
+- Corpus is 100% `jina-v3` embeddings — homogeneous vector space.
+- Known quality caveat: 3 JPM filings parsed iXBRL-as-HTML → blob chunks (419/428/517) → weak retrieval on these until v2 parser.
+
+## Deferred to v2 (quality)
+
+- **D — iXBRL XML parser** + corpus-wide re-ingest (fixes JPM blob chunks)
+- **Parent-document retrieval** (spec committed, not implemented)
+- **403 fallback bug** — nomic fallback triggers on 402 only; Jina signals balance exhaustion with 403 `AUTHZ_INSUFFICIENT_BALANCE`. Fix trigger; do NOT auto-nomic the existing jina-v3 corpus.

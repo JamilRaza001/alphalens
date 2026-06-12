@@ -779,6 +779,9 @@ v2 — WEEK 3-4
      Add: Entity extraction at ingestion time → entities table
      Add: Graph traversal branch inside Retrieve+Filter node
      Add: XBRL parser → financial_facts → graph nodes
+     Add: iXBRL-as-HTML parser fix + corpus-wide re-ingest (fixes JPM blob chunks: 419/428/517)
+     Add: Parent-document retrieval (spec committed)
+     Fix: nomic fallback trigger — catch 403 AUTHZ_INSUFFICIENT_BALANCE, not just 402
      Goal: Better trend/comparison queries (e.g. "Apple margin 2022 vs 2024")
 
      ↓ 2 weeks — measure KG impact vs pure vector
