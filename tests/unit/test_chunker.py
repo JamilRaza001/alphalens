@@ -151,6 +151,43 @@ def test_normal_sentence_not_flagged_oversized() -> None:
 
 
 # ---------------------------------------------------------------------------
+# S05a AC#5 -- pathological input: no sentence boundaries, single long run
+# ---------------------------------------------------------------------------
+
+
+def test_pathological_no_sentence_breaks_capped() -> None:
+    """S05a AC#5: one long run with no sentence breaks > cap; every output chunk <= cap."""
+    long_run = " ".join(f"word{i}" for i in range(100))  # 100 words
+    chunker = Chunker(
+        target_tokens=10,
+        max_tokens=20,
+        count_tokens=_word_count,
+        split_sentences=lambda text: [text],  # simulates spaCy returning XBRL blob as one sentence
+    )
+    chunks = chunker.chunk_sections([_section(long_run)])
+    assert len(chunks) > 0
+    for chunk in chunks:
+        assert (
+            chunk.token_count <= 20
+        ), f"chunk has {chunk.token_count} tokens > cap=20: {chunk.text!r}"
+
+
+def test_pathological_all_pieces_flagged_oversized() -> None:
+    """S05a: all pieces from a recursively-split oversized sentence carry oversized=True."""
+    long_run = " ".join(f"word{i}" for i in range(30))  # 30 words > target=10
+    chunker = Chunker(
+        target_tokens=10,
+        max_tokens=15,
+        count_tokens=_word_count,
+        split_sentences=lambda text: [text],
+    )
+    chunks = chunker.chunk_sections([_section(long_run)])
+    assert all(
+        chunk.metadata.get("oversized") is True for chunk in chunks
+    ), "every piece of a recursively-split oversized sentence must be flagged oversized"
+
+
+# ---------------------------------------------------------------------------
 # AC#5 -- overlap is sentence-granular, trailing sentences only
 # ---------------------------------------------------------------------------
 
@@ -172,9 +209,9 @@ def test_consecutive_chunks_overlap_by_trailing_sentences() -> None:
     # The overlap sentence (lines[1]) must appear in both chunk 0 and chunk 1
     overlap_sent = lines[1]
     assert overlap_sent in chunks[0].text, f"{overlap_sent!r} not in chunk 0: {chunks[0].text!r}"
-    assert chunks[1].text.startswith(overlap_sent), (
-        f"Chunk 1 should start with overlap sentence {overlap_sent!r}, " f"got: {chunks[1].text!r}"
-    )
+    assert chunks[1].text.startswith(
+        overlap_sent
+    ), f"Chunk 1 should start with overlap sentence {overlap_sent!r}, got: {chunks[1].text!r}"
 
 
 def test_overlap_does_not_exceed_overlap_tokens() -> None:

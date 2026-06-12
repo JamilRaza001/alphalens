@@ -128,11 +128,13 @@ class Chunker:
         self,
         target_tokens: int = 400,
         overlap_tokens: int = 50,
+        max_tokens: int = 512,
         count_tokens: TokenCounter | None = None,
         split_sentences: SentenceSplitter | None = None,
     ) -> None:
         self._target = target_tokens
         self._overlap = overlap_tokens
+        self._max_tokens = max_tokens
         self._count: TokenCounter = (
             count_tokens if count_tokens is not None else default_token_counter()
         )
@@ -159,6 +161,65 @@ class Chunker:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _split_recursive(self, text: str, max_tokens: int) -> list[str]:
+        """Split text by descending separators until every piece <= max_tokens.
+
+        Order: paragraph (\\n\\n, \\n) → sentence (self._split) → word packing →
+        binary character split (last resort; always terminates).
+        """
+        if self._count(text) <= max_tokens:
+            return [text] if text.strip() else []
+
+        # 1. Paragraph separators
+        for sep in ("\n\n", "\n"):
+            parts = [p.strip() for p in text.split(sep) if p.strip()]
+            if len(parts) > 1:
+                out: list[str] = []
+                for p in parts:
+                    out.extend(self._split_recursive(p, max_tokens))
+                return out
+
+        # 2. Sentence split — guard: splitter may return [text] unchanged (e.g. spaCy on XBRL blob)
+        sents = self._split(text)
+        if len(sents) > 1:
+            out = []
+            for s in sents:
+                out.extend(self._split_recursive(s, max_tokens))
+            return out
+
+        # 3. Word-level greedy packing
+        words = text.split()
+        if len(words) > 1:
+            out = []
+            bucket: list[str] = []
+            bucket_tok = 0
+            for word in words:
+                wt = self._count(word)
+                if wt > max_tokens:
+                    if bucket:
+                        out.append(" ".join(bucket))
+                        bucket, bucket_tok = [], 0
+                    out.extend(self._split_recursive(word, max_tokens))
+                elif bucket_tok + wt > max_tokens:
+                    out.append(" ".join(bucket))
+                    bucket, bucket_tok = [word], wt
+                else:
+                    bucket.append(word)
+                    bucket_tok += wt
+            if bucket:
+                out.append(" ".join(bucket))
+            return out
+
+        # 4. Binary character split — last resort; guaranteed to reduce size each call
+        if len(text) <= 1:
+            return [text] if text.strip() else []
+        mid = len(text) // 2
+        out = []
+        for half in (text[:mid].strip(), text[mid:].strip()):
+            if half:
+                out.extend(self._split_recursive(half, max_tokens))
+        return out
+
     def _chunk_section(self, section: Section) -> list[Chunk]:
         sentences = [s for s in self._split(section.text) if s]
         if not sentences:
@@ -177,20 +238,21 @@ class Chunker:
             sent0_tokens = self._count(sentences[i])
 
             # --- Oversized single sentence (AC#4) ---
-            # Emit as its own chunk; flag metadata; never split mid-sentence.
+            # Recursively split to <= self._max_tokens; flag all pieces as oversized.
             if sent0_tokens > self._target:
                 over_meta: dict[str, Any] = {**base_meta, "oversized": True}
-                chunks.append(
-                    Chunk(
-                        text=sentences[i],
-                        token_count=sent0_tokens,
-                        section=section.name,
-                        section_order=section.order,
-                        chunk_index=chunk_index,
-                        metadata=over_meta,
+                for piece in self._split_recursive(sentences[i], self._max_tokens):
+                    chunks.append(
+                        Chunk(
+                            text=piece,
+                            token_count=self._count(piece),
+                            section=section.name,
+                            section_order=section.order,
+                            chunk_index=chunk_index,
+                            metadata=over_meta,
+                        )
                     )
-                )
-                chunk_index += 1
+                    chunk_index += 1
                 i += 1
                 continue
 
