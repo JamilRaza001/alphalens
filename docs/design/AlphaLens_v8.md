@@ -501,6 +501,12 @@ def embed(texts: list[str], use_fallback: bool = False) -> list[list[float]]:
 
 Trigger: Jina free tier at 80% utilization (O6).
 
+**Rate limiting (Spec 06a — shipped):**
+- Proactive token bucket on the Jina path: **empty-start** (`initial_tokens=0`, no startup burst), refill at `jina_tpm_limit` (90K tok/min)
+- **Token-aware batching:** each Jina request capped at `jina_max_request_tokens` (6K summed tokens); nomic path stays count-based (128)
+- Safety invariant (config `model_validator`): `jina_tpm_limit + jina_max_request_tokens <= 100_000`
+- Why both: a token bucket paces the AVERAGE rate, but the provider enforces a rolling 60s SUM — large requests land as lumps and can overshoot the window
+
 ### 8.5 Embedding Versioning
 
 `chunks.embedding_model_version` values: `'jina-v3'` | `'nomic-embed-text-v1.5'`
@@ -635,18 +641,18 @@ Reference: `Phase1_Setup_Guide.md`. Remaining tasks:
 | # | Decision | Trigger to resolve | Default if not resolved | Status |
 |---|---|---|---|---|
 | O1 | Jina embedding dim: 768 vs 1024 | — | — | ✅ **RESOLVED: 768d (L17)** |
-| O2 | **spaCy vs blingfire** for sentence tokenization | Spec 05 (chunker) | spaCy (better for financial abbreviations) | ⏳ Pending |
+| O2 | **spaCy vs blingfire** for sentence tokenization | Spec 05 (chunker) | spaCy (better for financial abbreviations) | ✅ **RESOLVED: spaCy** (S7 chunker, DI splitter) |
 | O3 | **HyDE cost-benefit** — retry-only or first-pass too? | Spec 11 (agent nodes) | Retry-only (saves Groq tokens) | ⏳ Pending — note: HyDE only relevant in v3 retry loop; confirm if applicable to v1 at spec 10 authoring |
 | O4 | **Golden dataset** — 100–150 manual query/answer pairs sufficient? | Phase 2 evaluation milestone | Yes, manual curation | ⏳ Pending |
 | O5 | **SSE disconnect → Groq stream cancel** correctness | Spec 17 (observability) testing | Add explicit cancellation token | ⏳ Pending |
-| O6 | **Jina migration trigger** — 80% of free token grant? | Jina free tier balance reaches threshold | 80% utilization | ⏳ Pending |
+| O6 | **Jina migration trigger** — 80% of free token grant? | Jina free tier balance reaches threshold | 80% utilization | ✅ **RESOLVED: 80% (8M/10M auto-flip, S8 embeddings.py)** |
 | O7 | **Section detection fallback** for non-standard filings | Spec 04 (section detector) | Tag as "unstructured", skip section-aware chunking, flag in `metadata` | ⏳ Pending |
 | O8 | **Lambda cold start mitigation priority** | Spec 14 (Lambda deployment) | Warmup ping + lazy imports first; SnapStart only if still problematic | ⏳ Pending |
 | O9 | **Neon free tier overflow alert** at 80% or 90%? | Storage approaches limit | 80% (more reaction time) | ⏳ Pending |
 | O10 | **ECR cleanup automation** — Lambda cron / GitHub Action / manual? | After 3 redeploys | GitHub Action | ⏳ Pending |
 | O11 | **Lambda max concurrency** — default 1000 excessive? | Spec 14 deployment | Lower to 10 (caps blast radius) | ⏳ Pending |
 | O12 | **Cross-region tradeoff** — ap-southeast-1 vs ap-south-1? | Spec 14 deployment | Stick with ap-southeast-1 (DB co-location) | ⏳ Pending |
-| O13 | **Jina actual free tier size** — 10M or 1M? | Jina signup (Part 2.5) | Plan for 1M (worst case) | ⏳ Confirm on signup |
+| O13 | **Jina actual free tier size** — 10M or 1M? | Jina signup (Part 2.5) | Plan for 1M (worst case) | ✅ **RESOLVED: 10M confirmed** |
 | O14 | **ECR private vs public** at month 7 | Month 6 review | Decide based on credit balance | ⏳ Pending |
 
 ---

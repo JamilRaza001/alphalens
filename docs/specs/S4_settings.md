@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     jina_model:            str = "jina-embeddings-v3"
     jina_dimensions:       int = 768
     jina_free_tier_tokens: int = 1_000_000
+    jina_tpm_limit:        int = 90_000        # Spec 06a: token-bucket refill rate (tok/min)
+    jina_max_request_tokens: int = 6_000       # Spec 06a: per-request summed-token cap (Jina path)
+    # model_validator (Spec 06a): jina_tpm_limit + jina_max_request_tokens <= 100_000
     nomic_model:           str = "nomic-ai/nomic-embed-text-v1.5"
 
     # ── Reranker (in-process, L14) ─────────────────────────────────
