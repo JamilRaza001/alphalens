@@ -235,3 +235,4 @@ frontend/.vercel/
 
 # OS
 Thumbs.db
+*:Zone.Identifier
