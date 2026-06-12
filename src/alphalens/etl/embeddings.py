@@ -205,7 +205,14 @@ class EmbeddingClient:
                 "task": task,
             },
         )
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise httpx.HTTPStatusError(
+                f"{exc} — body: {r.text}",
+                request=exc.request,
+                response=exc.response,
+            ) from exc
         body: dict[str, Any] = r.json()
         # FIX 3: sort by per-item index — real Jina API does not guarantee response order
         items = sorted(body["data"], key=lambda d: d["index"])
