@@ -14,6 +14,7 @@ from uuid import UUID
 import aioboto3
 import asyncpg
 from botocore.config import Config
+from pydantic import ValidationError
 
 from alphalens.config import Settings, get_settings
 from alphalens.etl.chunker import Chunker
@@ -25,6 +26,7 @@ from alphalens.etl.state import (
     claim_retryable_filings,
     complete_attempt,
     fail_attempt,
+    reap_stale_running,
     record_step,
     start_attempt,
 )
@@ -131,6 +133,13 @@ async def run(settings: Settings, *, limit: int | None = None) -> RunReport:
         init=register_pgvector,
     )
     try:
+        # Startup-only: close orphaned 'running' jobs from a prior crashed run so they
+        # enter the normal backoff path instead of being re-claimed in a tight loop.
+        async with pool.acquire() as conn:
+            reaped = await reap_stale_running(conn)
+        if reaped:
+            _log.info("reaped %d stale running job(s) from a prior crashed run", reaped)
+
         claimed = 0
         processed = 0
         failed = 0
@@ -241,14 +250,16 @@ async def _process_one(filing_id: UUID, *, settings: Settings, pool: asyncpg.Poo
             await record_step(conn, job_id, IngestionStep.UPSERT)
             await upsert_embedded_chunks(conn, records)
 
-        async with pool.acquire() as conn:
+        # Atomic: both UPDATEs (job -> done, filing -> processed) commit all-or-nothing.
+        async with pool.acquire() as conn, conn.transaction():
             await complete_attempt(conn, job_id)
 
         _log.info("filing %s processed: %d chunks", filing_id, len(records))
 
     except Exception as exc:
         try:
-            async with pool.acquire() as conn:
+            # Atomic: job-fail UPDATE + attempt-count SELECT + conditional filing UPDATE.
+            async with pool.acquire() as conn, conn.transaction():
                 await fail_attempt(conn, job_id, current_step, str(exc)[:2000])
         except Exception:
             _log.exception("fail_attempt raised for filing %s job %s", filing_id, job_id)
@@ -294,22 +305,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Entrypoint: parse args, dispatch to discover/run via asyncio.run().
-    Returns 0 on success, non-zero on failure.
+
+    Exit-code contract (for schedulers / CI):
+      0 — success
+      2 — config/validation error (NOT retryable; fix the config)
+      1 — unexpected runtime error (may be transient; safe to retry next run)
     Wired as `python -m alphalens.etl.runner`."""
     args = build_parser().parse_args(argv)
-    settings = get_settings()
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
     try:
+        settings = get_settings()
+        logging.basicConfig(
+            level=settings.log_level.upper(),
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
         if args.cmd == "discover":
             _log.info("discover complete: %s", asyncio.run(discover(settings)))
         else:
             _log.info("run complete: %s", asyncio.run(run(settings, limit=args.limit)))
         return 0
+    except ValidationError as exc:
+        # Config/validation failure (missing/invalid env). Not retryable.
+        _log.error("Config error — not retryable: %s", exc)
+        return 2
     except Exception:
-        _log.exception("runner failed")
+        # Unexpected runtime error (incl. transient ValueError) — retryable.
+        _log.exception("Unexpected runtime error")
         return 1
 
 

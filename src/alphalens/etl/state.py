@@ -153,6 +153,31 @@ def next_backoff(
     return min(base_seconds * 2.0 ** (attempt - 1), max_seconds)
 
 
+async def reap_stale_running(conn: asyncpg.Connection[Any]) -> int:
+    """Mark leftover 'running' jobs from a prior crashed run as failed; return count reaped.
+
+    Run ONCE at run() startup, before the first claim_retryable_filings. A process
+    that crashes mid-pipeline leaves a 'running' job whose filing would otherwise be
+    re-claimed immediately (last_failed_at IS NULL → no backoff) and never closed.
+
+    Transition only (status -> 'failed', completed_at = now(), error marker); no rows
+    deleted, so the per-attempt audit trail is preserved. completed_at drives the normal
+    backoff path via claim_retryable_filings' last_failed_at. `step` is intentionally NOT
+    rewritten: it keeps the crash-stage (useful diagnostic) and avoids any step CHECK.
+
+    # SAFE ONLY UNDER SINGLE-RUNNER INVARIANT; revisit with v4 lease/SKIP LOCKED.
+    """
+    status: str = await conn.execute(
+        "UPDATE ingestion_jobs"
+        " SET status = 'failed',"
+        "     error = 'reaped: stale running job from prior crashed run',"
+        "     completed_at = now()"
+        " WHERE status = 'running'",
+    )
+    # asyncpg execute() returns a command tag like "UPDATE 3"; parse the trailing count.
+    return int(status.split()[-1]) if status else 0
+
+
 async def claim_retryable_filings(
     conn: asyncpg.Connection[Any],
     limit: int = 10,

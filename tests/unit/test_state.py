@@ -21,6 +21,7 @@ from alphalens.etl.state import (
     complete_attempt,
     fail_attempt,
     next_backoff,
+    reap_stale_running,
     record_step,
     start_attempt,
 )
@@ -157,6 +158,47 @@ async def test_ac8_claim_retryable_empty() -> None:
     conn = _FakeConn()
     result = await claim_retryable_filings(conn)
     assert result == []
+
+
+# ── reap_stale_running (#4) ──────────────────────────────────────────────────
+
+
+class _ReapConn:
+    """asyncpg.Connection stand-in whose execute() returns a command tag (e.g. 'UPDATE 3')."""
+
+    def __init__(self, command_tag: str = "UPDATE 0") -> None:
+        self._command_tag = command_tag
+        self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.execute_calls.append((sql, args))
+        return self._command_tag
+
+
+async def test_reap_returns_parsed_count() -> None:
+    """reap_stale_running parses asyncpg's command tag and returns the row count."""
+    conn = _ReapConn("UPDATE 3")
+    assert await reap_stale_running(conn) == 3
+
+
+async def test_reap_none_running() -> None:
+    """reap_stale_running returns 0 when no 'running' jobs remain."""
+    conn = _ReapConn("UPDATE 0")
+    assert await reap_stale_running(conn) == 0
+
+
+async def test_reap_transition_only_preserves_step_and_audit() -> None:
+    """Reaper flips status->failed + completed_at + error, targets only 'running',
+    deletes nothing, and does NOT rewrite step (crash-stage kept; avoids step CHECK)."""
+    conn = _ReapConn("UPDATE 1")
+    await reap_stale_running(conn)
+    assert len(conn.execute_calls) == 1
+    sql = conn.execute_calls[0][0]
+    assert "status = 'failed'" in sql
+    assert "completed_at = now()" in sql
+    assert "WHERE status = 'running'" in sql
+    assert "DELETE" not in sql.upper()
+    assert "step =" not in sql
 
 
 # ── AC#9 — no forbidden columns ──────────────────────────────────────────────

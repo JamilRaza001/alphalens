@@ -23,6 +23,7 @@ from alphalens.etl.runner import (
     run,
 )
 from alphalens.etl.state import IngestionStep
+from pydantic import BaseModel, ValidationError
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +104,7 @@ class _FakeConn:
         self._filing_row = filing_row
         self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
         self.fetchval_sqls: list[str] = []
+        self.transaction_calls: int = 0
 
     async def fetch(self, sql: str, *_: Any) -> list[Any]:
         if "companies" in sql.lower():
@@ -137,6 +139,7 @@ class _FakeConn:
         pass
 
     def transaction(self) -> _FakeTx:
+        self.transaction_calls += 1
         return _FakeTx()
 
 
@@ -394,6 +397,8 @@ async def test_ac7_process_one_success_calls_complete() -> None:
 
     mock_complete.assert_called_once()
     mock_fail.assert_not_called()
+    # A1 (#3): start_attempt + complete_attempt each run inside conn.transaction().
+    assert conn.transaction_calls >= 2
 
 
 # ── AC#8 — pipeline failure routes through state machine ─────────────────────
@@ -440,6 +445,8 @@ async def test_ac8_embed_failure_calls_fail_attempt() -> None:
     assert args[1] == _JOB_ID
     assert args[2] == IngestionStep.EMBED
     assert "quota exceeded" in args[3]
+    # A1 (#3): start_attempt + fail_attempt each run inside conn.transaction().
+    assert conn.transaction_calls >= 2
 
 
 # ── AC#9 — run is resumable (skips empty claim on re-invoke) ─────────────────
@@ -539,6 +546,34 @@ def test_ac11_main_returns_nonzero_on_failure() -> None:
         ),
     ):
         assert main(["discover"]) != 0
+
+
+def _make_validation_error() -> ValidationError:
+    """Build a real pydantic ValidationError (cannot be constructed directly)."""
+
+    class _Probe(BaseModel):
+        x: int
+
+    try:
+        _Probe(x="not-an-int")  # type: ignore[arg-type]
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected ValidationError")
+
+
+def test_a3_main_returns_2_on_config_error() -> None:
+    """A3 (#17): a config/validation failure (ValidationError) → exit code 2 (not retryable)."""
+    with patch("alphalens.etl.runner.get_settings", side_effect=_make_validation_error()):
+        assert main(["discover"]) == 2
+
+
+def test_a3_main_returns_1_on_runtime_valueerror() -> None:
+    """A3 (#17): a transient runtime ValueError is NOT a config error → exit code 1 (retryable)."""
+    with (
+        patch("alphalens.etl.runner.get_settings", return_value=_make_settings()),
+        patch("alphalens.etl.runner.asyncio.run", side_effect=ValueError("transient boom")),
+    ):
+        assert main(["discover"]) == 1
 
 
 def test_ac11_help_exits_zero() -> None:
