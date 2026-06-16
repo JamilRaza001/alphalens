@@ -29,7 +29,12 @@ target_metadata = None
 
 
 def _database_url() -> str:
-    """Return the migration database URL from NEON_DIRECT_URL (loads .env first)."""
+    """Return the migration DB URL from NEON_DIRECT_URL (loads .env first).
+
+    The project installs psycopg v3 (not psycopg2), so a bare ``postgresql://``
+    URL is rewritten to the explicit ``postgresql+psycopg://`` driver so SQLAlchemy
+    selects the installed DBAPI.
+    """
     load_dotenv()
     url = os.environ.get("NEON_DIRECT_URL")
     if not url:
@@ -37,6 +42,10 @@ def _database_url() -> str:
             "NEON_DIRECT_URL is not set — required for Alembic migrations "
             "(L12: Direct URL, not the pooled app URL)."
         )
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    elif url.startswith("postgres://"):
+        url = "postgresql+psycopg://" + url[len("postgres://") :]
     return url
 
 
