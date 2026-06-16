@@ -12,11 +12,11 @@ import re
 from collections.abc import Iterable
 from datetime import date
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aioboto3
 import httpx
-from botocore.config import Config
+from aiobotocore.config import AioConfig
 from botocore.exceptions import ClientError
 from pydantic import BaseModel, field_validator
 from tenacity import (
@@ -27,6 +27,11 @@ from tenacity import (
 )
 
 from alphalens.config import Settings
+
+if TYPE_CHECKING:
+    # Stub-only packages (dev deps) — never imported at runtime in the Lambda image.
+    from aiobotocore.session import ClientCreatorContext
+    from types_aiobotocore_s3.client import S3Client
 
 _log = logging.getLogger(__name__)
 
@@ -138,19 +143,19 @@ class EdgarClient:
             follow_redirects=True,
         )
         self._rate_limiter = RateLimiter()
-        self._session: Any = aioboto3.Session(
+        self._session = aioboto3.Session(
             aws_access_key_id=settings.r2_access_key_id.get_secret_value(),
             aws_secret_access_key=settings.r2_secret_access_key.get_secret_value(),
         )
-        self._r2_ctx: Any = None  # aioboto3 context manager handle
-        self._r2: Any = None  # entered S3 client
+        self._r2_ctx: ClientCreatorContext[S3Client] | None = None  # aioboto3 ctx handle
+        self._r2: S3Client | None = None  # entered S3 client
 
     async def __aenter__(self) -> EdgarClient:
         self._r2_ctx = self._session.client(
             "s3",
             endpoint_url=self._settings.r2_endpoint_url,
             region_name="auto",
-            config=Config(signature_version="s3v4"),
+            config=AioConfig(signature_version="s3v4"),
         )
         self._r2 = await self._r2_ctx.__aenter__()
         return self
@@ -236,17 +241,20 @@ class EdgarClient:
 
         Flow: R2 HEAD → hit: R2 GET; miss: SEC GET → R2 PUT → return bytes.
         """
+        if self._r2 is None:
+            raise RuntimeError("EdgarClient must be entered via 'async with' before fetch")
+        r2 = self._r2
         key = meta.r2_cache_key
         bucket = self._settings.r2_bucket_name
         try:
-            await self._r2.head_object(Bucket=bucket, Key=key)
-            obj: dict[str, Any] = await self._r2.get_object(Bucket=bucket, Key=key)
+            await r2.head_object(Bucket=bucket, Key=key)
+            obj = await r2.get_object(Bucket=bucket, Key=key)
             return bytes(await obj["Body"].read())
         except ClientError as exc:
             if exc.response["Error"]["Code"] not in ("404", "NoSuchKey"):
                 raise
         content: bytes = (await self._get_sec(meta.primary_doc_url)).content
-        await self._r2.put_object(Bucket=bucket, Key=key, Body=content, ContentType="text/html")
+        await r2.put_object(Bucket=bucket, Key=key, Body=content, ContentType="text/html")
         return content
 
     @retry(

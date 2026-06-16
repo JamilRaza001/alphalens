@@ -8,12 +8,12 @@ import logging
 import sys
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Literal, cast
+from typing import Literal, cast
 from uuid import UUID
 
 import aioboto3
 import asyncpg
-from botocore.config import Config
+from aiobotocore.config import AioConfig
 from pydantic import ValidationError
 
 from alphalens.config import Settings, get_settings
@@ -66,7 +66,7 @@ async def discover(settings: Settings, *, tickers: list[str] | None = None) -> D
     """List 2022-2026 10-K/10-Q filings for target companies (from the companies
     table) and enqueue them as status='pending'. Idempotent on accession_number.
     Never writes r2_key. `tickers=None` means all seeded companies."""
-    pool: asyncpg.Pool[Any] = await asyncpg.create_pool(
+    pool: asyncpg.Pool[asyncpg.Record] = await asyncpg.create_pool(
         settings.neon_database_url.get_secret_value(),
         min_size=1,
         max_size=5,
@@ -126,7 +126,7 @@ async def discover(settings: Settings, *, tickers: list[str] | None = None) -> D
 async def run(settings: Settings, *, limit: int | None = None) -> RunReport:
     """Claim and sequentially process pending/retryable filings end-to-end.
     `limit` caps filings processed this invocation (None = all). Resumable."""
-    pool: asyncpg.Pool[Any] = await asyncpg.create_pool(
+    pool: asyncpg.Pool[asyncpg.Record] = await asyncpg.create_pool(
         settings.neon_database_url.get_secret_value(),
         min_size=1,
         max_size=5,
@@ -175,7 +175,9 @@ async def run(settings: Settings, *, limit: int | None = None) -> RunReport:
 # ---- internal seams ---------------------------------------------------------
 
 
-async def _process_one(filing_id: UUID, *, settings: Settings, pool: asyncpg.Pool[Any]) -> None:
+async def _process_one(
+    filing_id: UUID, *, settings: Settings, pool: asyncpg.Pool[asyncpg.Record]
+) -> None:
     """Run one claimed filing through the full pipeline, recording each
     IngestionStep and routing failures through the state machine (backoff/retry)."""
     async with pool.acquire() as conn:
@@ -268,7 +270,7 @@ async def _process_one(filing_id: UUID, *, settings: Settings, pool: asyncpg.Poo
 
 async def _upload_html_to_r2(key: str, body: bytes, *, settings: Settings) -> None:
     """PUT filing HTML to R2 at `key` via aioboto3 (async S3-compatible client)."""
-    session: Any = aioboto3.Session(
+    session = aioboto3.Session(
         aws_access_key_id=settings.r2_access_key_id.get_secret_value(),
         aws_secret_access_key=settings.r2_secret_access_key.get_secret_value(),
     )
@@ -276,7 +278,7 @@ async def _upload_html_to_r2(key: str, body: bytes, *, settings: Settings) -> No
         "s3",
         endpoint_url=settings.r2_endpoint_url,
         region_name="auto",
-        config=Config(signature_version="s3v4"),
+        config=AioConfig(signature_version="s3v4"),
     ) as r2:
         await r2.put_object(
             Bucket=settings.r2_bucket_name, Key=key, Body=body, ContentType="text/html"

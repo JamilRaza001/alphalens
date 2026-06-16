@@ -6,6 +6,7 @@ All tests are offline (no network). Fixtures loaded from tests/fixtures/.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import pytest
 from alphalens.config import get_settings
@@ -281,3 +282,29 @@ async def test_integration_real_10k_detection() -> None:
         assert s.char_count == len(
             s.text
         ), f"Section {s.item_key!r}: char_count={s.char_count} != len(text)={len(s.text)}"
+
+
+# ---------------------------------------------------------------------------
+# D2 (#20) — char_count invariant raises ValueError (not AssertionError)
+# ---------------------------------------------------------------------------
+
+
+def test_char_count_invariant_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch, html_10k: bytes
+) -> None:
+    """D2: a char_count/len(text) mismatch raises ValueError (assert was replaced).
+
+    The guard is defensive — detect() always sets char_count=len(text), so we
+    monkeypatch Section to return a copy with char_count bumped by one, forcing the
+    mismatch on the structured path (html_10k yields >= 3 core items)."""
+    import alphalens.etl.sections as secmod
+
+    real_section = secmod.Section
+
+    def _mismatched_section(**kwargs: Any) -> Section:
+        sec = real_section(**kwargs)
+        return sec.model_copy(update={"char_count": sec.char_count + 1})
+
+    monkeypatch.setattr(secmod, "Section", _mismatched_section)
+    with pytest.raises(ValueError, match="char_count"):
+        secmod.SectionDetector("10-K").detect(html_10k)

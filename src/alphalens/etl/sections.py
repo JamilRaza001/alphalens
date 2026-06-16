@@ -262,7 +262,11 @@ class SectionDetector:
                 char_count=len(text),
                 metadata=meta,
             )
-            assert section.char_count == len(section.text)
+            if section.char_count != len(section.text):
+                raise ValueError(
+                    f"section {item_key!r} char_count {section.char_count} "
+                    f"!= len(text) {len(section.text)}"
+                )
             sections.append(section)
 
         return sections

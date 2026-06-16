@@ -21,6 +21,10 @@ from alphalens.etl.embeddings import EmbeddingResult
 
 _log = logging.getLogger(__name__)
 
+# A pool-acquired connection is a PoolConnectionProxy; a raw connection (e.g. the
+# create_pool `init=` callback) is a Connection. These helpers accept either.
+type DbConn = asyncpg.Connection[asyncpg.Record] | asyncpg.pool.PoolConnectionProxy[asyncpg.Record]
+
 _EMBEDDING_DIM: int = 768
 
 ModelVersion = Literal["jina-v3", "nomic-embed-text-v1.5"]
@@ -105,14 +109,14 @@ def assemble_embedded_chunks(
     return result
 
 
-async def register_pgvector(conn: asyncpg.Connection[Any]) -> None:
+async def register_pgvector(conn: DbConn) -> None:
     """Register the pgvector codec on a connection so list[float] binds to vector(768). Call on pool init."""
     from pgvector.asyncpg import register_vector  # noqa: PLC0415
 
     await register_vector(conn)
 
 
-async def detect_corpus_model(conn: asyncpg.Connection[Any]) -> ModelVersion | None:
+async def detect_corpus_model(conn: DbConn) -> ModelVersion | None:
     """Return an embedding_model_version already present in chunks, or None if the table is empty."""
     row = await conn.fetchrow(
         "SELECT embedding_model_version FROM chunks "
@@ -124,7 +128,7 @@ async def detect_corpus_model(conn: asyncpg.Connection[Any]) -> ModelVersion | N
 
 
 async def upsert_embedded_chunks(
-    conn: asyncpg.Connection[Any],
+    conn: DbConn,
     records: Sequence[EmbeddedChunk],
     *,
     batch_size: int = 500,

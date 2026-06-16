@@ -11,12 +11,15 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
 from uuid import UUID
 
 import asyncpg
 
 _log = logging.getLogger(__name__)
+
+# A pool-acquired connection is a PoolConnectionProxy; a raw connection (e.g. the
+# create_pool `init=` callback) is a Connection. State helpers accept either.
+type DbConn = asyncpg.Connection[asyncpg.Record] | asyncpg.pool.PoolConnectionProxy[asyncpg.Record]
 
 
 class FilingStatus(StrEnum):
@@ -48,7 +51,7 @@ class MaxAttemptsReached(Exception):
     """Raised when start_attempt is called on a filing that already has >= MAX_ATTEMPTS jobs."""
 
 
-async def attempt_count(conn: asyncpg.Connection[Any], filing_id: UUID) -> int:
+async def attempt_count(conn: DbConn, filing_id: UUID) -> int:
     """Return COUNT(*) of ingestion_jobs for the filing = attempts used so far."""
     result: int = await conn.fetchval(
         "SELECT COUNT(*) FROM ingestion_jobs WHERE filing_id = $1",
@@ -57,7 +60,7 @@ async def attempt_count(conn: asyncpg.Connection[Any], filing_id: UUID) -> int:
     return result
 
 
-async def start_attempt(conn: asyncpg.Connection[Any], filing_id: UUID) -> UUID:
+async def start_attempt(conn: DbConn, filing_id: UUID) -> UUID:
     """Open a new attempt: check count BEFORE insert, raise MaxAttemptsReached if >= MAX_ATTEMPTS.
 
     Gate: COUNT 0 → attempt 1 allowed, 1 → 2, 2 → 3; 3 → MaxAttemptsReached.
@@ -83,7 +86,7 @@ async def start_attempt(conn: asyncpg.Connection[Any], filing_id: UUID) -> UUID:
     return job_id
 
 
-async def record_step(conn: asyncpg.Connection[Any], job_id: UUID, step: IngestionStep) -> None:
+async def record_step(conn: DbConn, job_id: UUID, step: IngestionStep) -> None:
     """Set ingestion_jobs.step for the running job to the stage it has just entered."""
     await conn.execute(
         "UPDATE ingestion_jobs SET step = $1 WHERE job_id = $2",
@@ -92,7 +95,7 @@ async def record_step(conn: asyncpg.Connection[Any], job_id: UUID, step: Ingesti
     )
 
 
-async def complete_attempt(conn: asyncpg.Connection[Any], job_id: UUID) -> None:
+async def complete_attempt(conn: DbConn, job_id: UUID) -> None:
     """Close a successful attempt: job status='done', completed_at=now();
     parent filing status='processed'. filing_id is derived from the job row.
     """
@@ -110,7 +113,7 @@ async def complete_attempt(conn: asyncpg.Connection[Any], job_id: UUID) -> None:
 
 
 async def fail_attempt(
-    conn: asyncpg.Connection[Any],
+    conn: DbConn,
     job_id: UUID,
     step: IngestionStep,
     error: str,
@@ -153,7 +156,7 @@ def next_backoff(
     return min(base_seconds * 2.0 ** (attempt - 1), max_seconds)
 
 
-async def reap_stale_running(conn: asyncpg.Connection[Any]) -> int:
+async def reap_stale_running(conn: DbConn) -> int:
     """Mark leftover 'running' jobs from a prior crashed run as failed; return count reaped.
 
     Run ONCE at run() startup, before the first claim_retryable_filings. A process
@@ -179,7 +182,7 @@ async def reap_stale_running(conn: asyncpg.Connection[Any]) -> int:
 
 
 async def claim_retryable_filings(
-    conn: asyncpg.Connection[Any],
+    conn: DbConn,
     limit: int = 10,
 ) -> list[UUID]:
     """Return up to `limit` filing_ids eligible to (re)process for the batch driver.
