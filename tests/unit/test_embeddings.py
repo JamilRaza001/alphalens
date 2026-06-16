@@ -394,6 +394,32 @@ async def test_ac10_402_flips_to_nomic() -> None:
     assert client.jina_quota_exceeded()
 
 
+async def test_c1_tokens_retained_after_mid_loop_402() -> None:
+    """C1 (#5): a 402 on batch 2 keeps tokens already spent on batch 1 in the counter.
+
+    Same shape as test_ac10: 3 texts × 3000 tok, max_request=6000 → batch 1=[t0,t1] succeeds
+    (200, usage 2×5=10 tokens), batch 2=[t2] returns 402. The result flips to nomic, but the
+    10 Jina tokens from batch 1 must remain counted (committed per batch, not at end-of-loop).
+    """
+    jina_call_count = 0
+
+    def quota_on_second_batch(request: httpx.Request) -> httpx.Response:
+        nonlocal jina_call_count
+        jina_call_count += 1
+        if jina_call_count == 1:
+            return _fake_jina_handler(request)  # batch 1: 200, usage=2*5=10
+        return httpx.Response(402, json={"error": "quota exceeded"})  # batch 2: quota
+
+    client = _make_client(jina_handler=quota_on_second_batch, nomic_encode=fake_nomic_encode)
+    result = await client.embed_documents(["t0", "t1", "t2"], token_counts=[3000, 3000, 3000])
+
+    assert result.model_version == "nomic-embed-text-v1.5"
+    assert client.total_tokens_used == 10, (
+        "batch-1 tokens must be retained after a mid-loop 402 "
+        f"(expected 10, got {client.total_tokens_used})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC#11 — token accumulation
 # ---------------------------------------------------------------------------

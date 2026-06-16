@@ -278,7 +278,9 @@ async def _upload_html_to_r2(key: str, body: bytes, *, settings: Settings) -> No
         region_name="auto",
         config=Config(signature_version="s3v4"),
     ) as r2:
-        await r2.put_object(Bucket=settings.r2_bucket_name, Key=key, Body=body)
+        await r2.put_object(
+            Bucket=settings.r2_bucket_name, Key=key, Body=body, ContentType="text/html"
+        )
 
 
 # ---- CLI (argparse, D4) -----------------------------------------------------

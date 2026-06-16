@@ -7,6 +7,7 @@ No DB writes — those live in S9+.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Iterable
 from datetime import date
@@ -27,15 +28,26 @@ from tenacity import (
 
 from alphalens.config import Settings
 
+_log = logging.getLogger(__name__)
+
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 _ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash}/{doc}"
 
+# Transient network errors worth retrying (no HTTP status to inspect). httpx.TimeoutException
+# is the base for Connect/Read/Write/Pool timeouts — covered as a group.
+_TRANSIENT: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+)
+_RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
 
 def _is_retryable(exc: BaseException) -> bool:
-    """True for 429 and 5xx — those warrant a retry; other 4xx propagate immediately."""
-    return isinstance(exc, httpx.HTTPStatusError) and (
-        exc.response.status_code == 429 or exc.response.status_code >= 500
-    )
+    """Retry transient network errors and 429/5xx; other 4xx (401/402/404) propagate."""
+    if isinstance(exc, _TRANSIENT):
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _RETRYABLE_STATUS
 
 
 class FilingMetadata(BaseModel):
@@ -176,6 +188,13 @@ class EdgarClient:
         data: dict[str, Any] = (await self._get_sec(url)).json()
         recent: dict[str, list[Any]] = data["filings"]["recent"]
 
+        # The "recent" window holds the latest ~1000 filings. Older filings spill into
+        # paginated "files" entries we do not read. Harmless for the current 10 mega-cap
+        # CIKs over 2022-2026, but make the cliff loud if the corpus/window ever grows.
+        overflow: list[Any] = data["filings"].get("files") or []
+        if overflow:
+            _log.warning("EDGAR overflow for CIK %s: %d extra page(s) NOT read", cik, len(overflow))
+
         forms: list[str] = recent.get("form", [])
         filing_dates: list[str] = recent.get("filingDate", [])
         report_dates: list[str] = recent.get("reportDate", [])
@@ -227,7 +246,7 @@ class EdgarClient:
             if exc.response["Error"]["Code"] not in ("404", "NoSuchKey"):
                 raise
         content: bytes = (await self._get_sec(meta.primary_doc_url)).content
-        await self._r2.put_object(Bucket=bucket, Key=key, Body=content)
+        await self._r2.put_object(Bucket=bucket, Key=key, Body=content, ContentType="text/html")
         return content
 
     @retry(

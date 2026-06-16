@@ -8,14 +8,16 @@ Coverage:
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from alphalens.config import Settings
-from alphalens.etl.edgar import EdgarClient, FilingMetadata
+from alphalens.etl.edgar import EdgarClient, FilingMetadata, _is_retryable
 
 # ── AC #1: User-Agent field validator ─────────────────────────────────────────
 
@@ -117,6 +119,108 @@ async def test_fetch_primary_doc_idempotency(
     assert r2_mock.get_object.call_count == 1, "expected exactly 1 R2 GET"
     assert result1 == payload
     assert result2 == payload
+    # C4 (#13): the cache-miss PUT must set ContentType so R2 serves text/html.
+    assert r2_mock.put_object.call_args.kwargs.get("ContentType") == "text/html"
+
+
+# ── C2 (#6): retry predicate — transient + 429/5xx retried; 401/402/404 not ──
+
+
+def _status_error(code: int) -> httpx.HTTPStatusError:
+    req = httpx.Request("GET", "https://example.test")
+    resp = httpx.Response(code, request=req)
+    return httpx.HTTPStatusError(f"status {code}", request=req, response=resp)
+
+
+def test_is_retryable_transient_network_errors() -> None:
+    """Transient network errors (incl. all timeout subtypes via TimeoutException) → retry."""
+    assert _is_retryable(httpx.ConnectError("refused"))
+    assert _is_retryable(httpx.ReadTimeout("slow"))  # subclass of httpx.TimeoutException
+    assert _is_retryable(httpx.WriteTimeout("slow"))  # subclass of httpx.TimeoutException
+    assert _is_retryable(httpx.PoolTimeout("slow"))  # subclass of httpx.TimeoutException
+    assert _is_retryable(httpx.RemoteProtocolError("proto"))
+
+
+@pytest.mark.parametrize("code", [429, 500, 502, 503, 504])
+def test_is_retryable_status_retried(code: int) -> None:
+    assert _is_retryable(_status_error(code))
+
+
+@pytest.mark.parametrize("code", [401, 402, 404, 400, 403])
+def test_is_retryable_status_not_retried(code: int) -> None:
+    assert not _is_retryable(_status_error(code))
+
+
+def test_is_retryable_ignores_unrelated_exception() -> None:
+    assert not _is_retryable(ValueError("not network"))
+
+
+# ── C3 (#7): list_filings warns (but does not fail) on EDGAR overflow ──
+
+
+@pytest.mark.asyncio
+async def test_list_filings_warns_on_overflow(
+    mock_settings: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C3: a non-empty filings.files overflow logs a warning naming the CIK + page count."""
+    empty_recent: dict[str, list[str]] = {
+        "form": [],
+        "filingDate": [],
+        "reportDate": [],
+        "accessionNumber": [],
+        "primaryDocument": [],
+    }
+    payload: dict[str, Any] = {
+        "filings": {
+            "recent": empty_recent,
+            "files": [{"name": "CIK0000320193-submissions-001.json"}],
+        }
+    }
+    resp: MagicMock = MagicMock()
+    resp.json = MagicMock(return_value=payload)
+    resp.raise_for_status = MagicMock()
+    http_mock: MagicMock = MagicMock(spec=httpx.AsyncClient)
+    http_mock.get = AsyncMock(return_value=resp)
+    http_mock.aclose = AsyncMock()
+
+    client = EdgarClient(mock_settings, http_client=http_mock)
+    with caplog.at_level(logging.WARNING, logger="alphalens.etl.edgar"):
+        result = await client.list_filings("0000320193")
+
+    assert result == []
+    assert "overflow" in caplog.text.lower()
+    assert "0000320193" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_list_filings_no_warning_without_overflow(
+    mock_settings: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C3: no overflow key → no warning (current in-scope CIK behaviour unchanged)."""
+    payload: dict[str, Any] = {
+        "filings": {
+            "recent": {
+                "form": [],
+                "filingDate": [],
+                "reportDate": [],
+                "accessionNumber": [],
+                "primaryDocument": [],
+            }
+        }
+    }
+    resp: MagicMock = MagicMock()
+    resp.json = MagicMock(return_value=payload)
+    resp.raise_for_status = MagicMock()
+    http_mock: MagicMock = MagicMock(spec=httpx.AsyncClient)
+    http_mock.get = AsyncMock(return_value=resp)
+    http_mock.aclose = AsyncMock()
+
+    client = EdgarClient(mock_settings, http_client=http_mock)
+    with caplog.at_level(logging.WARNING, logger="alphalens.etl.edgar"):
+        result = await client.list_filings("0000320193")
+
+    assert result == []
+    assert "overflow" not in caplog.text.lower()
 
 
 # ── AC #11: Live SEC integration (skip by default) ────────────────────────────

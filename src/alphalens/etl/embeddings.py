@@ -41,11 +41,22 @@ NomicEncoder = Callable[[list[str]], list[list[float]]]
 # ---------------------------------------------------------------------------
 
 
+# Transient network errors worth retrying. httpx.TimeoutException is the base for
+# Connect/Read/Write/Pool timeouts — the embeddings POST carries a large body, so
+# Write/Pool timeouts are plausible, not just Connect/Read.
+_TRANSIENT: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+)
+_RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+
 def _is_retryable_jina(exc: BaseException) -> bool:
-    """True for 429 and 5xx — NOT for 402 (quota error, handled by caller)."""
-    return isinstance(exc, httpx.HTTPStatusError) and (
-        exc.response.status_code == 429 or exc.response.status_code >= 500
-    )
+    """Retry transient network errors and 429/5xx — NOT 402 (quota, handled by caller)."""
+    if isinstance(exc, _TRANSIENT):
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _RETRYABLE_STATUS
 
 
 # ---------------------------------------------------------------------------
@@ -305,18 +316,20 @@ class EmbeddingClient:
                         settings=self._settings,
                     )
                     jina_vectors.extend(vecs)
-                    call_tokens += tok  # authoritative Jina-reported tokens
+                    call_tokens += tok  # this call's running total (for tokens_used)
+                    # C1 (#5): commit per successful batch so a later 402 retains earlier spend.
+                    self._total_tokens += tok
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 402:
                     # FIX 1: discard all collected Jina vectors; re-embed entire input via nomic.
                     # Ensures homogeneous result — no mixed jina+nomic vectors under one tag.
+                    # Tokens already spent on batches 1..k-1 stay counted in self._total_tokens.
                     self._quota_exceeded = True
                     # fall through to nomic path below
                 else:
                     raise
             else:
-                # Jina path fully succeeded — commit tokens and return
-                self._total_tokens += call_tokens
+                # Jina path fully succeeded — tokens already committed per batch above.
                 self._validate_dims(jina_vectors)
                 return EmbeddingResult(
                     vectors=jina_vectors,
