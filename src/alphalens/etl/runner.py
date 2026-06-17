@@ -269,7 +269,12 @@ async def _process_one(
 
 
 async def _upload_html_to_r2(key: str, body: bytes, *, settings: Settings) -> None:
-    """PUT filing HTML to R2 at `key` via aioboto3 (async S3-compatible client)."""
+    """PUT filing HTML to R2 at `key` via aioboto3 (async S3-compatible client).
+
+    `key` is the canonical, DB-linked ``filings.r2_key`` (``filings/{cik}/{accession}.html``),
+    distinct from EdgarClient's upstream write-through cache key. See
+    ``FilingMetadata.r2_cache_key`` for why both keys are retained by design (#12).
+    """
     session = aioboto3.Session(
         aws_access_key_id=settings.r2_access_key_id.get_secret_value(),
         aws_secret_access_key=settings.r2_secret_access_key.get_secret_value(),

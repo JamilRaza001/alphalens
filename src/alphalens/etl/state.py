@@ -37,11 +37,11 @@ class JobStatus(StrEnum):
 
 
 class IngestionStep(StrEnum):
-    DOWNLOAD = "download"  # EDGAR fetch + R2 cache (S3)
-    PARSE = "parse"  # section detection   (S4)
-    CHUNK = "chunk"  # chunking            (S5)
-    EMBED = "embed"  # embeddings          (S6)
-    UPSERT = "upsert"  # Neon upsert         (S7)
+    DOWNLOAD = "download"  # EDGAR fetch + R2 cache (S5)
+    PARSE = "parse"  # section detection   (S6)
+    CHUNK = "chunk"  # chunking            (S7)
+    EMBED = "embed"  # embeddings          (S8)
+    UPSERT = "upsert"  # Neon upsert         (S9)
 
 
 MAX_ATTEMPTS: int = 3

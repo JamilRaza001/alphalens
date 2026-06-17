@@ -89,7 +89,18 @@ class FilingMetadata(BaseModel):
 
     @property
     def r2_cache_key(self) -> str:
-        """R2 object key: ``{cik}/{accession_nodash}.html``."""
+        """R2 object key for the upstream write-through cache: ``{cik}/{accession_nodash}.html``.
+
+        Two distinct R2 keys exist by design (#12):
+          - THIS key (``{cik}/{accession_nodash}.html``) is the EDGAR write-through cache,
+            keyed on the dash-stripped accession to mirror SEC archive paths. It dedupes raw
+            upstream fetches and is owned by :class:`EdgarClient`.
+          - The canonical, DB-linked location is ``filings.r2_key``
+            (``filings/{cik}/{accession_number}.html``, a generated column), written during
+            ingestion by ``runner._upload_html_to_r2``.
+        Both are retained: the cache short-circuits re-fetching from SEC, while ``r2_key`` is
+        the stable address the rest of the system references.
+        """
         return f"{self.cik}/{self.accession_nodash}.html"
 
 

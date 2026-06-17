@@ -21,13 +21,12 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from alphalens.config import Settings, get_settings
+from alphalens.config import Settings
 from alphalens.etl.rate_limit import TokenBucket, get_jina_bucket, token_aware_batches
 
 _log = logging.getLogger(__name__)
 
 _nomic_model: Any = None  # module-level lazy-load sentinel (SentenceTransformer)
-_JINA_HTTP: httpx.AsyncClient | None = None  # module-level singleton for direct jina_embed calls
 
 # ---------------------------------------------------------------------------
 # Public type aliases
@@ -101,18 +100,6 @@ def default_nomic_encoder(model_name: str) -> NomicEncoder:
 # ---------------------------------------------------------------------------
 
 
-def _get_jina_http() -> httpx.AsyncClient:
-    """Lazy module-level httpx singleton for direct jina_embed() calls.
-
-    No explicit close/lifecycle — prod always injects self._http from EmbeddingClient.
-    This fallback is only reached when jina_embed() is called outside the client.
-    """
-    global _JINA_HTTP
-    if _JINA_HTTP is None:
-        _JINA_HTTP = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
-    return _JINA_HTTP
-
-
 @retry(
     retry=retry_if_exception(_is_retryable_jina),
     wait=wait_exponential_jitter(initial=1, max=30),
@@ -179,34 +166,6 @@ async def _jina_paced(
         resolved_tc = list(token_counts)
     await bucket.acquire(sum(resolved_tc))
     return await _jina_post(texts, task=task, http=http, settings=settings)
-
-
-async def jina_embed(
-    texts: list[str],
-    token_counts: Sequence[int] | None = None,
-    *,
-    task: str = "retrieval.passage",
-    bucket: TokenBucket | None = None,
-    _http: httpx.AsyncClient | None = None,
-) -> list[list[float]]:
-    """Embed via Jina v3 (truncate_dim=768), pacing through the token bucket.
-
-    Acquires bucket tokens exactly once before the HTTP call. token_counts defaults
-    to the project's existing token-count utility (same as chunker). bucket defaults
-    to the process-wide get_jina_bucket() singleton.
-    task: "retrieval.passage" for document chunks, "retrieval.query" for search queries.
-    _http: test injection seam only — omit in production.
-    """
-    _bucket = bucket or get_jina_bucket()
-    vecs, _ = await _jina_paced(
-        texts,
-        token_counts,
-        task=task,
-        bucket=_bucket,
-        http=_http or _get_jina_http(),
-        settings=get_settings(),
-    )
-    return vecs
 
 
 # ---------------------------------------------------------------------------
