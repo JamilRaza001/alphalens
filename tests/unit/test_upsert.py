@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+
 from alphalens.etl.chunker import Chunk
 from alphalens.etl.embeddings import EmbeddingResult
 from alphalens.etl.upsert import (
@@ -356,6 +357,7 @@ async def test_integration_upsert_round_trip() -> None:
     from datetime import date
 
     import asyncpg as _asyncpg
+
     from alphalens.config import get_settings
     from alphalens.etl.upsert import detect_corpus_model, register_pgvector
 

@@ -12,6 +12,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+
 from alphalens.etl.state import (
     FilingStatus,
     IngestionStep,
@@ -101,9 +102,9 @@ async def test_ac5_fail_returns_failed_at_count_3() -> None:
     result = await fail_attempt(conn, _JOB_ID, IngestionStep.EMBED, "quota exceeded")
     assert result == FilingStatus.FAILED
     sql_texts = [call[0] for call in conn.execute_calls]
-    assert any(
-        "'failed'" in sql for sql in sql_texts
-    ), "expected UPDATE filings SET status = 'failed' when count >= MAX_ATTEMPTS"
+    assert any("'failed'" in sql for sql in sql_texts), (
+        "expected UPDATE filings SET status = 'failed' when count >= MAX_ATTEMPTS"
+    )
 
 
 async def test_ac5_fail_returns_processing_at_count_1() -> None:
@@ -112,9 +113,9 @@ async def test_ac5_fail_returns_processing_at_count_1() -> None:
     result = await fail_attempt(conn, _JOB_ID, IngestionStep.PARSE, "parse error")
     assert result == FilingStatus.PROCESSING
     sql_texts = [call[0] for call in conn.execute_calls]
-    assert not any(
-        "status = 'failed'" in sql for sql in sql_texts
-    ), "filing must NOT be set to 'failed' when count < MAX_ATTEMPTS"
+    assert not any("status = 'failed'" in sql for sql in sql_texts), (
+        "filing must NOT be set to 'failed' when count < MAX_ATTEMPTS"
+    )
 
 
 async def test_ac5_fail_returns_processing_at_count_2() -> None:
@@ -239,6 +240,7 @@ async def test_integration_state_machine() -> None:
     from datetime import date
 
     import asyncpg as _asyncpg
+
     from alphalens.config import get_settings
 
     settings = get_settings()
@@ -358,9 +360,9 @@ async def test_integration_state_machine() -> None:
 
         # ── AC#8 part 2: claim_retryable_filings excludes 'failed' ───────────
         retryable2 = await claim_retryable_filings(conn)
-        assert (
-            filing_id2 not in retryable2
-        ), "failed filing must NOT appear in claim_retryable_filings"
+        assert filing_id2 not in retryable2, (
+            "failed filing must NOT appear in claim_retryable_filings"
+        )
 
     finally:
         await tr.rollback()

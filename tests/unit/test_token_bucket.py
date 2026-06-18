@@ -12,6 +12,7 @@ import asyncio
 import time
 
 import pytest
+
 from alphalens.etl.rate_limit import TokenBucket, token_aware_batches
 
 # ---------------------------------------------------------------------------
@@ -100,9 +101,9 @@ async def test_ac2_acquire_beyond_available_sleeps(fake_clock: list[float]) -> N
     # Now request 500 more tokens (deficit = 500, rate = 500/s → expect ~1.0 s sleep)
     await bucket.acquire(500)
 
-    assert fake_clock[0] == pytest.approx(
-        1.0, abs=0.01
-    ), f"Expected ~1.0 s of mocked sleep, got {fake_clock[0]}"
+    assert fake_clock[0] == pytest.approx(1.0, abs=0.01), (
+        f"Expected ~1.0 s of mocked sleep, got {fake_clock[0]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +154,9 @@ async def test_ac8_concurrent_second_is_paced(fake_clock: list[float]) -> None:
     await asyncio.gather(_timed_acquire(600), _timed_acquire(600))
 
     # One of the two coroutines must have slept (whichever queued behind the lock)
-    assert (
-        max(elapsed_records) >= 0.35
-    ), f"Expected one acquire to sleep ≥ 0.4 s (±0.05), got elapsed={elapsed_records}"
+    assert max(elapsed_records) >= 0.35, (
+        f"Expected one acquire to sleep ≥ 0.4 s (±0.05), got elapsed={elapsed_records}"
+    )
     # Total mocked time advanced by the sleep
     assert fake_clock[0] >= 0.35
 

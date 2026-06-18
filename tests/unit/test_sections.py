@@ -9,10 +9,11 @@ import os
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
+
 from alphalens.config import get_settings
 from alphalens.etl.edgar import EdgarClient
 from alphalens.etl.sections import Section, SectionDetector
-from pydantic import ValidationError
 
 # ---------------------------------------------------------------------------
 # AC #11 — construction
@@ -201,9 +202,9 @@ def test_char_count_equals_len_text(html_10k: bytes, html_10q: bytes) -> None:
     for html, form in [(html_10k, "10-K"), (html_10q, "10-Q")]:
         detector = SectionDetector(form)  # type: ignore[arg-type]
         for s in detector.detect(html):
-            assert (
-                s.char_count == len(s.text)
-            ), f"{form} section {s.item_key!r}: char_count={s.char_count} != len(text)={len(s.text)}"
+            assert s.char_count == len(s.text), (
+                f"{form} section {s.item_key!r}: char_count={s.char_count} != len(text)={len(s.text)}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +263,9 @@ async def test_integration_real_10k_detection() -> None:
     sections = detector.detect(html)
 
     # Must not fall back to O7 on a well-formed real 10-K
-    assert not any(
-        s.item_key == "unstructured" for s in sections
-    ), "O7 fallback triggered on real Apple 10-K — detector failed to find 3 core items"
+    assert not any(s.item_key == "unstructured" for s in sections), (
+        "O7 fallback triggered on real Apple 10-K — detector failed to find 3 core items"
+    )
     assert len(sections) >= 3
 
     # Core items present
@@ -279,9 +280,9 @@ async def test_integration_real_10k_detection() -> None:
     # Every section has non-empty normalized text and char_count invariant
     for s in sections:
         assert s.text, f"Section {s.item_key!r} has empty text"
-        assert s.char_count == len(
-            s.text
-        ), f"Section {s.item_key!r}: char_count={s.char_count} != len(text)={len(s.text)}"
+        assert s.char_count == len(s.text), (
+            f"Section {s.item_key!r}: char_count={s.char_count} != len(text)={len(s.text)}"
+        )
 
 
 # ---------------------------------------------------------------------------

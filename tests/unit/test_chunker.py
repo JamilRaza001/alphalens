@@ -15,6 +15,7 @@ from itertools import groupby
 from typing import Any
 
 import pytest
+
 from alphalens.etl.chunker import Chunker, TokenCounter
 from alphalens.etl.sections import Section
 
@@ -167,9 +168,9 @@ def test_pathological_no_sentence_breaks_capped() -> None:
     chunks = chunker.chunk_sections([_section(long_run)])
     assert len(chunks) > 0
     for chunk in chunks:
-        assert (
-            chunk.token_count <= 20
-        ), f"chunk has {chunk.token_count} tokens > cap=20: {chunk.text!r}"
+        assert chunk.token_count <= 20, (
+            f"chunk has {chunk.token_count} tokens > cap=20: {chunk.text!r}"
+        )
 
 
 def test_pathological_all_pieces_flagged_oversized() -> None:
@@ -182,9 +183,9 @@ def test_pathological_all_pieces_flagged_oversized() -> None:
         split_sentences=lambda text: [text],
     )
     chunks = chunker.chunk_sections([_section(long_run)])
-    assert all(
-        chunk.metadata.get("oversized") is True for chunk in chunks
-    ), "every piece of a recursively-split oversized sentence must be flagged oversized"
+    assert all(chunk.metadata.get("oversized") is True for chunk in chunks), (
+        "every piece of a recursively-split oversized sentence must be flagged oversized"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +210,9 @@ def test_consecutive_chunks_overlap_by_trailing_sentences() -> None:
     # The overlap sentence (lines[1]) must appear in both chunk 0 and chunk 1
     overlap_sent = lines[1]
     assert overlap_sent in chunks[0].text, f"{overlap_sent!r} not in chunk 0: {chunks[0].text!r}"
-    assert chunks[1].text.startswith(
-        overlap_sent
-    ), f"Chunk 1 should start with overlap sentence {overlap_sent!r}, got: {chunks[1].text!r}"
+    assert chunks[1].text.startswith(overlap_sent), (
+        f"Chunk 1 should start with overlap sentence {overlap_sent!r}, got: {chunks[1].text!r}"
+    )
 
 
 def test_overlap_does_not_exceed_overlap_tokens() -> None:
@@ -264,9 +265,9 @@ def test_chunk_index_resets_per_section() -> None:
     for section_name, group in groupby(chunks, key=lambda c: c.section):
         group_list = list(group)
         indices = [c.chunk_index for c in group_list]
-        assert indices == list(
-            range(len(indices))
-        ), f"chunk_index not contiguous in section {section_name!r}: {indices}"
+        assert indices == list(range(len(indices))), (
+            f"chunk_index not contiguous in section {section_name!r}: {indices}"
+        )
 
 
 def test_section_order_equals_source_section_order() -> None:
@@ -445,9 +446,9 @@ def test_integration_real_10k_chunking(html_10k: bytes) -> None:
 
     for chunk in chunks:
         # AC#2: stored token_count must match a fresh recount
-        assert chunk.token_count == chunker._count(
-            chunk.text
-        ), f"token_count mismatch on chunk {chunk.chunk_index} of section {chunk.section!r}"
+        assert chunk.token_count == chunker._count(chunk.text), (
+            f"token_count mismatch on chunk {chunk.chunk_index} of section {chunk.section!r}"
+        )
         assert chunk.text.strip() != "", "Empty chunk text"
         assert chunk.chunk_index >= 0
 
@@ -463,6 +464,6 @@ def test_integration_real_10k_chunking(html_10k: bytes) -> None:
 
     # AC#11: every chunk carries item_key in metadata
     for chunk in chunks:
-        assert (
-            "item_key" in chunk.metadata
-        ), f"item_key missing from chunk metadata: {chunk.metadata}"
+        assert "item_key" in chunk.metadata, (
+            f"item_key missing from chunk metadata: {chunk.metadata}"
+        )

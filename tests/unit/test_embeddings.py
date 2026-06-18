@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+
 from alphalens.etl.embeddings import EmbeddingClient, EmbeddingResult
 from alphalens.etl.rate_limit import TokenBucket
 
@@ -380,17 +381,17 @@ async def test_ac10_402_flips_to_nomic() -> None:
     )
     result = await client.embed_documents(["t0", "t1", "t2"], token_counts=[3000, 3000, 3000])
 
-    assert (
-        result.model_version == "nomic-embed-text-v1.5"
-    ), f"expected nomic-embed-text-v1.5, got {result.model_version}"
+    assert result.model_version == "nomic-embed-text-v1.5", (
+        f"expected nomic-embed-text-v1.5, got {result.model_version}"
+    )
     assert len(result.vectors) == 3, f"expected 3 vectors, got {len(result.vectors)}"
     for i, vec in enumerate(result.vectors):
-        assert (
-            vec == [_NOMIC_SENTINEL] * _DIM
-        ), f"vectors[{i}] should be nomic sentinel ({_NOMIC_SENTINEL}), got {vec[0]}"
-    assert (
-        jina_call_count == 2
-    ), f"Jina handler should be called exactly 2× (batch1+batch2 no retry), got {jina_call_count}"
+        assert vec == [_NOMIC_SENTINEL] * _DIM, (
+            f"vectors[{i}] should be nomic sentinel ({_NOMIC_SENTINEL}), got {vec[0]}"
+        )
+    assert jina_call_count == 2, (
+        f"Jina handler should be called exactly 2× (batch1+batch2 no retry), got {jina_call_count}"
+    )
     assert client.jina_quota_exceeded()
 
 

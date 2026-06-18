@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+
 from alphalens.config import Settings
 from alphalens.etl.edgar import EdgarClient, FilingMetadata, _is_retryable
 

@@ -30,10 +30,11 @@ import sys
 import time
 import traceback
 
+from dotenv import load_dotenv
+
 from alphalens.config import get_settings
 from alphalens.etl import runner
 from alphalens.etl.edgar import EdgarClient
-from dotenv import load_dotenv
 
 _BODY = b"<html><body>aioconfig round-trip probe</body></html>"
 _CONTENT_TYPE = "text/html"

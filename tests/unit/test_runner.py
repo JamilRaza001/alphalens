@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+from pydantic import BaseModel, ValidationError
+
 from alphalens.etl.runner import (
     DiscoverReport,
     _process_one,
@@ -23,7 +25,6 @@ from alphalens.etl.runner import (
     run,
 )
 from alphalens.etl.state import IngestionStep
-from pydantic import BaseModel, ValidationError
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -618,6 +619,7 @@ async def test_integration_discover_and_run_one() -> None:
     NOTE: R2 objects written during the test are NOT automatically cleaned up.
     """
     import asyncpg as _asyncpg
+
     from alphalens.config import get_settings
 
     settings = get_settings()
