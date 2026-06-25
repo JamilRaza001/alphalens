@@ -153,4 +153,4 @@ def get_settings() -> Settings:
     return the same object.  Use this function everywhere — never call
     ``Settings()`` directly.
     """
-    return Settings()  # type: ignore[call-arg]
+    return Settings()
