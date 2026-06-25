@@ -10,7 +10,10 @@
 | S8 | Embedding Client | DONE | `bb038ff` | Jina v3 primary (truncate_dim=768) + nomic-embed-text-v1.5 fallback (native 768d), async w/ lazy nomic load + to_thread, quota auto-flip (8M/10M), 402 whole-call re-embed, 768d asserts, RRF-ready; einops dep added; 20 unit + 1 real-models integration test
 | S9 | Upsert Pipeline | DONE | `caefd23` | EmbeddedChunk assembly (count + 768d check, global re-index, per-section idx in metadata, model stamp) + idempotent batched upsert (ON CONFLICT filing_id,chunk_index) + mixed-model + corpus guards; pgvector codec + JSONB; 15 unit + 1 real-Neon integration |
 | S10 | Filing State Machine | DONE | `720a7bd` | FilingStatus/JobStatus/IngestionStep StrEnums; MAX_ATTEMPTS=3; COUNT-based retry (no retry_count col); app-side exponential backoff 2/4/8s; claim_retryable_filings two-query + Python filter; caller-owned transactions; 12 unit + 1 real-Neon integration test |
+| S11 | ETL Runner | DONE | `c37c8d3` | discover + run orchestrator per Spec 11; drives the 151/151 backfill; runner.py + m01 R2-key migration + 614-line unit suite. S22 hardening (atomic attempt writes, stale-running reaper, meaningful exit codes) added later in `9614651` |
+| S12 | Agent State | DONE | `ca832cc` | AgentState TypedDict + QueryPlan/RetrievedChunk/ScoredChunk/Citation/TimeRange (Pydantic v2); D1 confidence Literal["low","high"], D2 single-source query_plan, D3 confidence_reason, D4 RetrievedChunk (agent-side, distinct from ETL Chunk); L5 reducer/L6/L7/L19; live-DB verified (UUIDs, single chunks→filings join, section nullable); mypy --strict clean; spec c0a0f50 |
 | Doc | Schema Reconcile — queries as 5th table | DONE | `7d065cb` | queries DDL added to §6.1 + S2 spec + Phase1 guide; financial_facts/entities correctly marked v2-deferred everywhere; decision #9 locked in schema_reconcile_to_live.md |
+| Chore | pydantic.mypy plugin | DONE | `b0ac2e6` | strict kwarg checking on Pydantic models; dropped now-redundant type-ignore in config.py |
 
 ## Phase 1 ETL Backfill
 
