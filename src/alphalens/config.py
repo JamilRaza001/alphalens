@@ -63,6 +63,9 @@ class Settings(BaseSettings):
 
     # ── Reranker (L3, L14) ────────────────────────────────────────────────────
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_top_n: int = (
+        5  # top-N ScoredChunks kept by the Rerank node; eval-tunable (env: RERANK_TOP_N)
+    )
 
     # ── AWS ───────────────────────────────────────────────────────────────────
     # In Lambda, credentials come from the IAM execution role — these are None.

@@ -39,7 +39,12 @@ class TimeRange(BaseModel):
 
     # "2022 vs 2024" -> [2022, 2024]; 2023 intentionally absent. A naive
     # range(start, end) would over-require 2023 and create false coverage gaps.
-    years: list[int]
+    years: list[int] = Field(
+        description=(
+            "Discrete list of the exact reporting years named in the query, e.g. "
+            "'2022 vs 2024' -> [2022, 2024]. Do NOT fill in intermediate years."
+        )
+    )
 
 
 class QueryPlan(BaseModel):
@@ -49,11 +54,34 @@ class QueryPlan(BaseModel):
     top-level copies of these fields.
     """
 
-    tickers: list[str]  # ["AAPL", "MSFT"]
-    intent: Intent
-    time_range: TimeRange
-    sub_questions: list[str]
-    entities: list[str]  # v1 metadata filtering + v2 KG traversal
+    tickers: list[str] = Field(
+        description="Uppercase stock ticker symbols the query is about, e.g. ['AAPL', 'MSFT']."
+    )
+    intent: Intent = Field(
+        description="Single query-intent class: comparative, temporal, factual, or qualitative."
+    )
+    time_range: TimeRange = Field(description="Discrete reporting years the query targets.")
+    sub_questions: list[str] = Field(
+        description="The query decomposed into atomic, independently-answerable sub-questions."
+    )
+    entities: list[str] = Field(
+        description="Salient non-ticker entities (people, products, segments, metrics) named in the query."
+    )
+
+
+class EvalVerdict(BaseModel):
+    """Structured output of the Evaluate node's LLM sufficiency signal (D4).
+
+    Consumed only when the deterministic coverage check found no gaps. Field
+    order is deliberate: `reasoning` FIRST gives strict constrained decoding a
+    chain-of-thought lift before it commits to the boolean. The node uses ONLY
+    `.sufficient` for control flow; `reasoning` is captured for Opik tracing.
+    """
+
+    reasoning: str = Field(
+        description="Brief justification for the sufficiency judgment (chain-of-thought, logged for tracing)."
+    )
+    sufficient: bool = Field(description="True iff the reranked evidence fully answers the query.")
 
 
 class RetrievedChunk(BaseModel):
@@ -105,6 +133,11 @@ class AgentState(TypedDict):
 
     # -- Plan: set once by Node 1; sole home of tickers/intent/entities (D2) --
     query_plan: QueryPlan
+    # Requested tickers dropped by the Plan input-rail because they are not in the
+    # 10-company corpus at all (pre-retrieval). Distinct from coverage_gaps, which
+    # are in-corpus (ticker, year) cells that retrieval MISSED (post-rerank).
+    # No reducer -- replaced. Surfaced by Synthesize's honesty-rail.
+    unavailable_tickers: list[str]
 
     # -- Mutable per pass --
     query: str  # == original_query in v1 (v3 Refine rewrites it -- L6)
