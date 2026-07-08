@@ -8,9 +8,9 @@
 
 ## 0. Quick Summary (paste this into a new chat to resume context)
 
-> **AlphaLens** — RAG agent over SEC 10-K/10-Q filings (top 10 S&P 500, 2022–2026, ~200 filings, ~22k chunks). Query latency target ≤15s, ~$0/mo cost target.
+> **AlphaLens** — RAG agent over SEC 10-K/10-Q filings (top 10 S&P 500, 2022–2026, ~200 filings, ~16,676 chunks). Query latency target ≤15s, ~$0/mo cost target.
 >
-> **Stack (locked):** AWS Lambda Container (FastAPI + LangGraph 5-node + Lambda Web Adapter) → Neon Postgres (pgvector HNSW `VECTOR(768)` + tsvector GIN) + Cloudflare R2 (filings cache) + Groq LLaMA 3.3 70B + Jina v3 embeddings (`truncate_dim=768`) + nomic-embed-text-v1.5 fallback + ms-marco-MiniLM-L-6-v2 reranker (in-process). Frontend: Next.js 15 on Vercel via SSE. Region: `ap-southeast-1` (Singapore). Auth: Vercel OIDC (Lambda URL `auth=NONE`, PyJWT middleware). Observability: Opik (LLM traces) + Sentry (frontend errors) + CloudWatch (Lambda logs).
+> **Stack (locked):** AWS Lambda Container (FastAPI + LangGraph 5-node + Lambda Web Adapter) → Neon Postgres (pgvector HNSW `VECTOR(768)` + tsvector GIN) + Cloudflare R2 (filings cache) + Groq `openai/gpt-oss-120b` + Jina v3 embeddings (`truncate_dim=768`) + nomic-embed-text-v1.5 fallback + ms-marco-MiniLM-L-6-v2 reranker (in-process). Frontend: Next.js 15 on Vercel via SSE. Region: `ap-southeast-1` (Singapore). Auth: Vercel OIDC (Lambda URL `auth=NONE`, PyJWT middleware). Observability: Opik (LLM traces) + Sentry (frontend errors) + CloudWatch (Lambda logs).
 >
 > **RAG type:** Single-Pass Agentic RAG. Graph: `Plan → Retrieve+Filter → Rerank → Evaluate → Synthesize`. No retry loop in v1 (deferred to v3). KG-Augmented RAG deferred to v2 (Apache AGE). XBRL parser deferred to v2.
 >
@@ -59,7 +59,8 @@
 | v6 | (prior) | Full consolidated design — superseded v5 + patch |
 | v7 | (prior) | Master doc: consolidates v6 + honest cost reality + Pakistan operational notes + $100 AWS credits constraint + project status tracker. Superseded v6. |
 | v8 | May 1, 2026 | Design Review Session 2: 7 locked changes applied (see below). Supersedes v7. |
-| **v8.1 patch (current)** | Jun 7, 2026 | Schema & state machine reconciled to live (decisions #1–#8); §6 + §8.2 corrected; §3 unchanged. |
+| v8.1 patch | Jun 7, 2026 | Schema & state machine reconciled to live (decisions #1–#8); §6 + §8.2 corrected; §3 unchanged. |
+| **v8.2 patch (current)** | Jul 8, 2026 | Design Review Sessions 25–26: LLM → `openai/gpt-oss-120b` (Groq, free-tier replacement after Llama 3.3 deprecation); Retrieve → per-cell fan-out / query-decomposition; Evaluate → two-signal (deterministic coverage-check + LLM sufficiency, coverage precedence); ticker resolution input-rail documented; O3 HyDE resolved (not used); corpus count corrected to ~16,676. §3 unchanged. |
 
 ### What's New in v8 vs v7
 
@@ -87,7 +88,7 @@
 | Filing types | 10-K (annual) + 10-Q (quarterly) |
 | Time range | 2022–2026 |
 | Filing volume | ~200 filings |
-| Chunk volume | ~22,000 chunks |
+| Chunk volume | ~16,676 chunks |
 | Query latency target | ≤15 seconds end-to-end |
 | Concurrent users | 10 (portfolio-demo scale) |
 | Monthly queries | ~600 (20 users × 30 queries) |
@@ -141,12 +142,12 @@ These decisions are **locked**. Any change requires explicit version bump (v8 �
 
 | Layer | Technology | Why |
 |---|---|---|
-| **LLM** | Groq + LLaMA 3.3 70B Versatile | Free tier; sub-second inference |
+| **LLM** | Groq + `openai/gpt-oss-120b` | Free-tier replacement after Llama 3.3 deprecation; sub-second inference |
 | **Embeddings (primary)** | Jina v3 (`truncate_dim=768`) | ~1M free tokens; MRL truncation to 768d valid |
 | **Embeddings (fallback)** | nomic-embed-text-v1.5 @ 768d | Best free local 768d model: 8192 token context, 86.2% retrieval acc, MRL native, Apache 2.0 |
 | **Embedding versioning** | `embedding_model_version` column | Enables gradual migration without big-bang re-embed |
 | **Database** | Neon serverless Postgres | Scale-to-zero compute, S3-backed storage; pgvector + tsvector both standard extensions |
-| **Vector Index** | HNSW (m=16, ef_construction=64) on `VECTOR(768)` | Optimal recall/latency for 22k chunks; 25% faster than 1024d |
+| **Vector Index** | HNSW (m=16, ef_construction=64) on `VECTOR(768)` | Optimal recall/latency for ~16,676 chunks; 25% faster than 1024d |
 | **Lexical Index** | tsvector + GIN | Postgres-native; no separate search service |
 | **Agent Framework** | LangGraph (5-node, single-pass) | Declarative graph, state accumulation via `operator.add` reducer, forward-compatible with v3 retry cycle |
 | **Reranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` (in-process) | Industry standard; baked at build time; ~80MB; no separate Lambda |
@@ -184,7 +185,7 @@ These decisions are **locked**. Any change requires explicit version bump (v8 �
 │  AWS Lambda (Agent — single container)  │
 │  - FastAPI + LangGraph 5-node           │
 │  - ms-marco-MiniLM-L-6-v2 (in-process) │ ◄────► Groq LLM
-│  - Function URL auth=NONE               │        (Llama 3.3 70B)
+│  - Function URL auth=NONE               │        (openai/gpt-oss-120b)
 │  - PyJWT OIDC middleware                │
 │  - Jina v3 primary / nomic fallback     │
 │  - 1M req/mo always-free                │
@@ -220,9 +221,12 @@ These decisions are **locked**. Any change requires explicit version bump (v8 �
 └──────┬───────┘
        ▼
 ┌──────────────┐
-│ 2. Retrieve  │ Hybrid: HNSW vector + tsvector lexical
-│  + Filter    │ Metadata filters in WHERE clause (ticker,
-│              │ time_range, section_type) → top-K via RRF
+│ 2. Retrieve  │ Per-cell fan-out (query decomposition): one
+│  + Filter    │ hybrid query per (ticker × sub-question) cell —
+│              │ HNSW vector + tsvector lexical, metadata
+│              │ filters in WHERE clause, RRF fusion per cell,
+│              │ then merge. Per-cell k/n config-driven,
+│              │ pinned at S15.
 └──────┬───────┘
        ▼
 ┌──────────────┐
@@ -231,7 +235,8 @@ These decisions are **locked**. Any change requires explicit version bump (v8 �
 └──────┬───────┘
        ▼
 ┌──────────────┐
-│ 4. Evaluate  │ LLM self-assessment on retrieved evidence
+│ 4. Evaluate  │ Two-signal: deterministic coverage-check +
+│              │ LLM sufficiency (coverage takes precedence)
 │              │ → annotates confidence: low | high
 │              │ (annotation only — no retry in v1)
 └──────┬───────┘
@@ -280,7 +285,7 @@ CREATE TABLE filings (
 CREATE INDEX idx_filings_cik_date ON filings(cik, filing_date DESC);
 CREATE INDEX idx_filings_ticker_date ON filings(ticker, filing_date DESC);
 
--- chunks: ~22,000 rows
+-- chunks: ~16,676 rows
 CREATE TABLE chunks (
     chunk_id UUID PRIMARY KEY,
     filing_id UUID NOT NULL REFERENCES filings(filing_id) ON DELETE CASCADE,
@@ -344,7 +349,7 @@ CREATE INDEX idx_queries_not_ok   ON queries (created_at DESC) WHERE status != '
 
 | Component | Size |
 |---|---|
-| 22k embeddings × 768d × 4B | ~66 MB |
+| 16,676 embeddings × 768d × 4B | ~51 MB |
 | HNSW index overhead (~1.5×) | ~100 MB |
 | Chunk text + tsvector | ~88 MB |
 | Other tables | ~50 MB |
@@ -398,14 +403,14 @@ class AgentState(TypedDict):
 | Node | Responsibility | LLM call? |
 |---|---|---|
 | **1. Plan** | Decompose query → tickers, intent, time_range, sub_questions, entities | ✅ Yes |
-| **2. Retrieve+Filter** | Hybrid HNSW + tsvector search; metadata filters in WHERE clause; RRF fusion | ❌ No |
+| **2. Retrieve+Filter** | Per-cell fan-out (query decomposition): one hybrid HNSW + tsvector query per (ticker × sub-question) cell; metadata filters in WHERE clause; RRF fusion per cell, then merge. Per-cell k/n config-driven, pinned at S15 | ❌ No |
 | **3. Rerank** | Cross-encoder in-process (ms-marco-MiniLM-L-6-v2) → top-N scored chunks | ❌ No |
-| **4. Evaluate** | LLM self-assessment on evidence quality → annotate `confidence` (low/high) | ✅ Yes |
+| **4. Evaluate** | Two-signal: deterministic coverage-check + LLM sufficiency assessment (coverage takes precedence) → annotate `confidence` (low/high) | ✅ Yes |
 | **5. Synthesize** | Groq streams answer with citations via SSE; surfaces low-confidence flag if set | ✅ Yes |
 
 ### 7.3 RAG Classification
 
-- **"Agentic"** — Plan node does LLM-driven query decomposition; Evaluate node does LLM self-assessment
+- **"Agentic"** — Plan node does LLM-driven query decomposition that drives per-cell fan-out retrieval; Evaluate node runs a two-signal check (deterministic coverage + LLM sufficiency, coverage precedence)
 - **"Single-Pass"** — Evaluate annotates confidence but cannot trigger a retry in v1
 - **NOT "Fully Agentic"** — that requires Evaluate → Refine → Retrieve cycle (v3)
 
@@ -427,6 +432,16 @@ class GroqCircuitBreaker:
 - HALF_OPEN → OPEN: 1 failed request
 
 **When OPEN:** agent returns degraded response (top reranked chunks without LLM synthesis), with explicit "LLM unavailable" notice in citations.
+
+### 7.5 Ticker Resolution (Input Rail)
+
+Tickers are resolved through a three-step input rail, not free-form LLM extraction:
+
+1. **DB-allowlist** — the set of valid tickers is loaded from the `companies` table (10 rows in v1); this is the authoritative universe.
+2. **Prompt-inject** — the allowlist is injected into the Plan-node prompt so the LLM can only map company mentions onto known tickers.
+3. **Validate** — the LLM's proposed tickers are validated against the allowlist after generation; anything off-allowlist is dropped before retrieval.
+
+This keeps the Plan node from hallucinating tickers for companies outside the corpus and bounds the retrieval space to filings that actually exist.
 
 ---
 
@@ -642,7 +657,7 @@ Reference: `Phase1_Setup_Guide.md`. Remaining tasks:
 |---|---|---|---|---|
 | O1 | Jina embedding dim: 768 vs 1024 | — | — | ✅ **RESOLVED: 768d (L17)** |
 | O2 | **spaCy vs blingfire** for sentence tokenization | Spec 05 (chunker) | spaCy (better for financial abbreviations) | ✅ **RESOLVED: spaCy** (S7 chunker, DI splitter) |
-| O3 | **HyDE cost-benefit** — retry-only or first-pass too? | Spec 11 (agent nodes) | Retry-only (saves Groq tokens) | ⏳ Pending — note: HyDE only relevant in v3 retry loop; confirm if applicable to v1 at spec 10 authoring |
+| O3 | **HyDE** — adopt for retrieval at all? | Spec 11 (agent nodes) | Not used | ✅ **RESOLVED: NOT used.** Revisit only if failure analysis shows weak recall on underspecified/qualitative queries |
 | O4 | **Golden dataset** — 100–150 manual query/answer pairs sufficient? | Phase 2 evaluation milestone | Yes, manual curation | ⏳ Pending |
 | O5 | **SSE disconnect → Groq stream cancel** correctness | Spec 17 (observability) testing | Add explicit cancellation token | ⏳ Pending |
 | O6 | **Jina migration trigger** — 80% of free token grant? | Jina free tier balance reaches threshold | 80% utilization | ✅ **RESOLVED: 80% (8M/10M auto-flip, S8 embeddings.py)** |
@@ -889,7 +904,7 @@ For AlphaLens (~$3/year usage): irrelevant. For combined cloud usage across mult
 | **CIK** | Central Index Key — SEC's unique identifier for filers |
 | **CU-hour** | Compute Unit hour — Neon's billing metric. 1 CU = 1 vCPU + 4 GB RAM |
 | **HNSW** | Hierarchical Navigable Small World — graph-based ANN index |
-| **HyDE** | Hypothetical Document Embeddings — RAG technique generating hypothetical answers, then retrieving similar real chunks (v3+) |
+| **HyDE** | Hypothetical Document Embeddings — RAG technique generating hypothetical answers, then retrieving similar real chunks. Evaluated and not used (see O3) |
 | **KG-Augmented RAG** | RAG variant that augments vector search with explicit entity relationship traversal via a knowledge graph (v2) |
 | **MD&A** | Management's Discussion and Analysis — narrative section of 10-K/10-Q |
 | **MRL** | Matryoshka Representation Learning — embedding technique where shorter prefixes of a vector remain semantically meaningful, enabling flexible-dim truncation downstream |
@@ -910,11 +925,11 @@ For AlphaLens (~$3/year usage): irrelevant. For combined cloud usage across mult
 For pasting into a new chat to instantly resume context:
 
 ```
-AlphaLens v8 — RAG agent over SEC 10-K/10-Q filings (top 10 S&P, 2022-2026, ~22k chunks).
+AlphaLens v8 — RAG agent over SEC 10-K/10-Q filings (top 10 S&P, 2022-2026, ~16,676 chunks).
 
 Stack (locked): AWS Lambda Container (FastAPI + LangGraph 5-node, single container)
 → Neon Postgres (pgvector HNSW VECTOR(768) + tsvector GIN) + Cloudflare R2
-+ Groq LLaMA 3.3 70B + Jina v3 (truncate_dim=768) + nomic-embed-text-v1.5 fallback
++ Groq openai/gpt-oss-120b + Jina v3 (truncate_dim=768) + nomic-embed-text-v1.5 fallback
 + ms-marco-MiniLM-L-6-v2 reranker (in-process). Frontend: Next.js 15 on Vercel via SSE.
 Region ap-southeast-1. Lambda URL auth=NONE + Vercel OIDC middleware.
 
