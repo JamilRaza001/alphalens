@@ -67,6 +67,14 @@ class Settings(BaseSettings):
         5  # top-N ScoredChunks kept by the Rerank node; eval-tunable (env: RERANK_TOP_N)
     )
 
+    # ── Synthesis circuit breaker (L8, S14) ───────────────────────────────────
+    breaker_failure_threshold: int = (
+        3  # consecutive hard failures to trip; env: BREAKER_FAILURE_THRESHOLD (D2)
+    )
+    breaker_reset_timeout_seconds: float = (
+        30.0  # OPEN cool-off before probe; env: BREAKER_RESET_TIMEOUT_SECONDS (D3)
+    )
+
     # ── AWS ───────────────────────────────────────────────────────────────────
     # In Lambda, credentials come from the IAM execution role — these are None.
     # In local dev / CI, set them explicitly for deployer access.

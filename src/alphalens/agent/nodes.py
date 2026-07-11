@@ -29,6 +29,7 @@ from langchain_groq import ChatGroq
 from langgraph.runtime import Runtime
 from sentence_transformers import CrossEncoder
 
+from alphalens.agent.circuit_breaker import SynthesisCircuitBreaker
 from alphalens.agent.prompts import (
     EVALUATE_SYSTEM_PROMPT,
     SYNTHESIZE_SYSTEM_PROMPT,
@@ -60,6 +61,7 @@ class AgentContext:
     reranker: CrossEncoder  # ms-marco-MiniLM-L-6-v2, startup-loaded (L3)
     pool: Pool  # asyncpg pool (consumed by retrieve_node in S15)
     allowed_tickers: frozenset[str]  # DB-derived allowlist (companies table) -- input-rail gate
+    breaker: SynthesisCircuitBreaker  # S14: guards the Groq synthesis stream, built at cold-start
 
 
 # Every node conforms to this shape -> S16 wiring is uniform.
@@ -191,8 +193,18 @@ async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> 
             ),
         ),
     ]
-    stream = stream_synthesis(runtime.context.llm, messages)  # S14 wraps THIS seam
-    return {"answer_stream": stream, "citations": citations}
+    ctx = runtime.context
+
+    # Real LLM stream (the S13 seam), deferred so the breaker gates it lazily at drain time.
+    def protected() -> AsyncGenerator[str, None]:
+        return stream_synthesis(ctx.llm, messages)
+
+    # Degraded stream: top reranked SEC chunks, deterministic, NO LLM (honesty rail).
+    def fallback() -> AsyncGenerator[str, None]:
+        return degraded_stream(state["reranked_chunks"])
+
+    # S14: route synthesis through the circuit breaker (OPEN -> serve `fallback`).
+    return {"answer_stream": ctx.breaker.stream(protected, fallback), "citations": citations}
 
 
 # ── Groq streaming seam -- S14 circuit-breaker wraps this function ────────────
@@ -209,3 +221,23 @@ async def stream_synthesis(
         content = chunk.content
         if isinstance(content, str) and content:
             yield content
+
+
+# ── Degraded (no-LLM) fallback -- served when the S14 breaker is OPEN ──────────
+async def degraded_stream(chunks: list[ScoredChunk]) -> AsyncGenerator[str, None]:
+    """No-LLM fallback: stream the top reranked chunk texts verbatim with source tags.
+
+    Served when the circuit breaker is OPEN (Groq outage). This is a REAL answer -- the
+    honesty rail -- not an error: surface the retrieved evidence, never fabricate synthesis.
+    Lives HERE (not circuit_breaker.py) so the breaker stays AgentState-agnostic.
+    """
+    yield (
+        "_Synthesis is temporarily unavailable; showing the most relevant source "
+        "excerpts directly._\n"
+    )
+    if not chunks:
+        yield "\nNo relevant filing excerpts were retrieved for this query.\n"
+        return
+    for sc in chunks:
+        c = sc.chunk
+        yield f"\n[{c.ticker} {c.filing_type} {c.period_year} · {c.section}]\n{c.text}\n"

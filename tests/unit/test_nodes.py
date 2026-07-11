@@ -21,6 +21,7 @@ from langchain_groq import ChatGroq
 from langgraph.runtime import Runtime
 from sentence_transformers import CrossEncoder
 
+from alphalens.agent.circuit_breaker import SynthesisCircuitBreaker
 from alphalens.agent.nodes import (
     AgentContext,
     compute_coverage_gaps,
@@ -102,7 +103,11 @@ _ALLOWED = frozenset({"AAPL", "MSFT", "GOOGL"})
 
 
 def _ctx(
-    *, llm: Any = None, reranker: Any = None, allowed: frozenset[str] = _ALLOWED
+    *,
+    llm: Any = None,
+    reranker: Any = None,
+    allowed: frozenset[str] = _ALLOWED,
+    breaker: SynthesisCircuitBreaker | None = None,
 ) -> AgentContext:
     # Fakes stand in for the real deps; cast to satisfy AgentContext's typed fields.
     return AgentContext(
@@ -110,6 +115,10 @@ def _ctx(
         reranker=cast(CrossEncoder, reranker if reranker is not None else _FakeReranker()),
         pool=cast(Pool, object()),  # never touched by S13 nodes (retrieve is a stub)
         allowed_tickers=allowed,
+        # Fresh breaker -> CLOSED, so synthesize passes the real LLM stream through untouched.
+        breaker=breaker
+        if breaker is not None
+        else SynthesisCircuitBreaker(failure_threshold=3, reset_timeout_seconds=30.0),
     )
 
 
