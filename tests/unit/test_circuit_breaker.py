@@ -28,6 +28,7 @@ from alphalens.agent.circuit_breaker import (
 )
 from alphalens.agent.nodes import AgentContext, degraded_stream, synthesize_node
 from alphalens.agent.state import AgentState, RetrievedChunk, ScoredChunk
+from alphalens.etl.embeddings import EmbeddingClient
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
 
@@ -368,6 +369,7 @@ async def test_synthesize_node_routes_open_breaker_to_degraded() -> None:
         pool=cast(Pool, object()),
         allowed_tickers=frozenset({"AAPL"}),
         breaker=breaker,
+        embedder=cast(EmbeddingClient, object()),  # unused by synthesize; satisfies the field
     )
     reranked = [
         ScoredChunk(

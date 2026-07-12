@@ -1,9 +1,9 @@
 """Unit tests for src/alphalens/agent/nodes.py (S13).
 
 Every node is exercised in isolation with a fake ``AgentContext`` (fake llm, fake
-reranker) and a hand-built ``AgentState`` -- no live Groq / DB / graph. Retrieve is a
-deliberate stub (S15), so it is only asserted to raise. No end-to-end/integration test
-until S15 real retrieval + S16 wiring land (per spec Gotcha).
+reranker) and a hand-built ``AgentState`` -- no live Groq / DB / graph. Retrieve's
+per-cell fan-out is covered separately in ``test_retrieve_node.py`` (S15). No
+end-to-end/integration test until S16 graph wiring lands (per spec Gotcha).
 
 asyncio_mode=auto: async tests run without @pytest.mark.asyncio.
 Runtime construction: langgraph 1.2.1's Runtime is a dataclass with all fields
@@ -15,7 +15,6 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any, cast
 
-import pytest
 from asyncpg import Pool
 from langchain_groq import ChatGroq
 from langgraph.runtime import Runtime
@@ -28,7 +27,6 @@ from alphalens.agent.nodes import (
     evaluate_node,
     plan_node,
     rerank_node,
-    retrieve_node,
     synthesize_node,
     validate_tickers,
 )
@@ -41,6 +39,7 @@ from alphalens.agent.state import (
     TimeRange,
 )
 from alphalens.config import get_settings
+from alphalens.etl.embeddings import EmbeddingClient
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
 
@@ -108,17 +107,20 @@ def _ctx(
     reranker: Any = None,
     allowed: frozenset[str] = _ALLOWED,
     breaker: SynthesisCircuitBreaker | None = None,
+    embedder: Any = None,
 ) -> AgentContext:
     # Fakes stand in for the real deps; cast to satisfy AgentContext's typed fields.
     return AgentContext(
         llm=cast(ChatGroq, llm if llm is not None else _FakeLLM()),
         reranker=cast(CrossEncoder, reranker if reranker is not None else _FakeReranker()),
-        pool=cast(Pool, object()),  # never touched by S13 nodes (retrieve is a stub)
+        pool=cast(Pool, object()),  # never touched by these nodes (retrieve tested separately)
         allowed_tickers=allowed,
         # Fresh breaker -> CLOSED, so synthesize passes the real LLM stream through untouched.
         breaker=breaker
         if breaker is not None
         else SynthesisCircuitBreaker(failure_threshold=3, reset_timeout_seconds=30.0),
+        # retrieve_node is exercised in test_retrieve_node.py; a stand-in suffices here.
+        embedder=cast(EmbeddingClient, embedder if embedder is not None else object()),
     )
 
 
@@ -216,12 +218,8 @@ async def test_plan_node_drops_unavailable() -> None:
     assert llm.with_structured_output_kwargs == {"method": "json_schema", "strict": True}
 
 
-# ── Retrieve node (stub) ──────────────────────────────────────────────────────
-
-
-async def test_retrieve_node_raises_notimplemented() -> None:
-    with pytest.raises(NotImplementedError):
-        await retrieve_node(_state(), _runtime(_ctx()))
+# ── Retrieve node: real per-cell fan-out lives in test_retrieve_node.py (S15) ──
+# The former stub (NotImplementedError) is gone -- retrieve_node is implemented in S15.
 
 
 # ── Rerank node ───────────────────────────────────────────────────────────────

@@ -64,8 +64,15 @@ class Settings(BaseSettings):
     # ── Reranker (L3, L14) ────────────────────────────────────────────────────
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     rerank_top_n: int = (
-        5  # top-N ScoredChunks kept by the Rerank node; eval-tunable (env: RERANK_TOP_N)
+        8  # top-N ScoredChunks kept by the Rerank node; eval-tunable (env: RERANK_TOP_N) — S15 D2
     )
+
+    # ── Retrieval — per-cell hybrid fan-out (S15 D1) ──────────────────────────
+    # All env-overridable: RETRIEVAL_K_VECTOR, RETRIEVAL_K_LEXICAL, RETRIEVAL_RRF_C, RETRIEVAL_N_PER_CELL.
+    retrieval_k_vector: int = 20  # HNSW candidates fetched per cell (before fusion)
+    retrieval_k_lexical: int = 20  # ts_rank_cd candidates fetched per cell (before fusion)
+    retrieval_rrf_c: int = 60  # RRF smoothing constant in 1/(c + rank); standard, not tuned per-run
+    retrieval_n_per_cell: int = 10  # RRF survivors kept per cell → merge
 
     # ── Synthesis circuit breaker (L8, S14) ───────────────────────────────────
     breaker_failure_threshold: int = (
