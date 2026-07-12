@@ -307,3 +307,6 @@ LIMIT $8;
 - **HyDE** — ruled out (D6, S13): small query-document shape gap, hybrid handles precise entities, financial
   facts are hallucination-intolerant.
 - **Cerebras fallback lane / not-hardcoding model IDs** → v2 infra.
+- **S16 dependency:** the agent asyncpg pool MUST be built with `init=register_pgvector` (same as
+  `etl/runner.py:133`), or the `list[float]`→`$1::vector` binding fails at first live run. All S15
+  unit tests use a fake pool and will pass regardless — this only surfaces in S16's live run.
