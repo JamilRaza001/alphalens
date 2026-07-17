@@ -12,6 +12,8 @@ control-flow logic.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from alphalens.agent.state import ScoredChunk
 
 # ── Plan node ─────────────────────────────────────────────────────────────────
@@ -23,31 +25,45 @@ questions strictly from SEC 10-K / 10-Q filings.
 Decompose the user's question into a structured plan with these fields:
 - tickers: the uppercase stock ticker symbols the question is about.
 - intent: exactly one of comparative | temporal | factual | qualitative.
-- time_range.years: the DISCRETE reporting years explicitly named or clearly implied. \
-List only the years actually asked for -- e.g. "2022 vs 2024" -> [2022, 2024]; do NOT \
-add intermediate years such as 2023.
+- time_range.years: the DISCRETE reporting years explicitly named or clearly implied. Each \
+array element must be a SINGLE distinct 4-digit year -- one element per year. Never merge two \
+years into one number, and never add intermediate years that were not asked for.
 - sub_questions: the question broken into atomic, independently-answerable parts.
 - entities: salient non-ticker entities (people, products, segments, financial metrics).
 
-The corpus only covers these tickers:
-{allowlist}
-Prefer tickers from this list when the user names a company; this list only GUIDES you \
--- a downstream hard gate drops any ticker outside the corpus, so never invent tickers to \
-satisfy the user.
+Examples (time_range.years):
+- "2023 vs 2024" -> years: [2023, 2024]
+  NEVER [20232024] -- that merges two years into one number and is always wrong.
+- "2022 vs 2024" -> years: [2022, 2024]   (do NOT add the intermediate 2023)
+- "in fiscal 2024" -> years: [2024]
+
+The corpus only covers these companies (TICKER — Company name):
+{roster}
+Use this ticker->name map to resolve a company the user names to its ticker (grounded \
+resolution -- do NOT guess a ticker from memory). This list only GUIDES you -- a downstream \
+hard gate drops any ticker outside the corpus, so never invent tickers to satisfy the user.
 
 Return ONLY the structured fields. Do not answer the question."""
 
 
-def build_plan_system_prompt(allowed_tickers: frozenset[str]) -> str:
-    """Fixed instructions with the (static, v1) allowlist baked in.
+def build_plan_system_prompt(
+    allowed_tickers: frozenset[str], ticker_roster: Mapping[str, str]
+) -> str:
+    """Fixed instructions with the (static, v1) corpus roster baked in (S16/D3a).
 
-    Returns the SAME string for a given corpus (allowlist is sorted, so ordering is
-    stable) -> Groq prompt-cache hit. If the `companies` seed changes, the allowlist
-    regenerates once at the next cold-start (expected). The allowlist here only GUIDES
-    the LLM; `validate_tickers` in nodes.py is the hard gate.
+    Returns the SAME string for a given corpus (the roster is rendered ticker-sorted, so
+    ordering is stable) -> Groq prompt-cache hit. If the `companies` seed changes, the roster
+    regenerates once at the next cold-start (expected). The roster here only GUIDES the LLM and
+    grounds word->ticker resolution; `validate_tickers` in nodes.py is the hard gate.
+
+    `allowed_tickers` is retained in the signature as the authoritative rail set; when it and
+    the roster's keys diverge, only tickers present in the roster are surfaced to the model
+    (the roster is the display source), while `validate_tickers` still enforces
+    `allowed_tickers` output-side.
     """
-    allowlist = ", ".join(sorted(allowed_tickers))
-    return _PLAN_SYSTEM_TEMPLATE.format(allowlist=allowlist)
+    lines = [f"- {ticker} — {ticker_roster[ticker]}" for ticker in sorted(ticker_roster)]
+    roster = "\n".join(lines) if lines else "(none)"
+    return _PLAN_SYSTEM_TEMPLATE.format(roster=roster)
 
 
 def build_plan_user_msg(query: str) -> str:
@@ -106,6 +122,9 @@ incomplete or unsupported by the retrieved evidence.
 - If any requested companies are unavailable (not in the corpus), state explicitly that they \
 are outside AlphaLens's coverage and were not analyzed. Keep this distinct from evidence that \
 was simply not retrieved.
+- If any requested years are unavailable (not understood, or outside the corpus's coverage \
+years), state explicitly that they are outside AlphaLens's coverage and were not analyzed. \
+Keep this distinct from evidence that was simply not retrieved.
 
 Write a clear, concise analyst answer."""
 
@@ -115,13 +134,16 @@ def build_synthesize_user_msg(
     reranked: list[ScoredChunk],
     confidence: str,
     unavailable_tickers: list[str],
+    unavailable_years: list[int],
 ) -> str:
     """Assemble the human turn: question, evidence, confidence flag, and the
-    unavailable-ticker note (worded distinctly from coverage gaps)."""
+    unavailable-ticker / unavailable-year notes (both worded distinctly from coverage gaps)."""
     unavailable = ", ".join(unavailable_tickers) if unavailable_tickers else "(none)"
+    bad_years = ", ".join(str(y) for y in unavailable_years) if unavailable_years else "(none)"
     return (
         f"User question:\n{query}\n\n"
         f"Confidence flag: {confidence}\n"
-        f"Unavailable (out-of-corpus) tickers: {unavailable}\n\n"
+        f"Unavailable (out-of-corpus) tickers: {unavailable}\n"
+        f"Unavailable (out-of-coverage) years: {bad_years}\n\n"
         f"Retrieved evidence:\n{_render_evidence(reranked)}"
     )

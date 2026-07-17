@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable
+import logging
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -50,6 +51,8 @@ from alphalens.agent.state import (
 from alphalens.config import get_settings
 from alphalens.etl.embeddings import EmbeddingClient  # S8 query embedder (jina-v3)
 
+_log = logging.getLogger(__name__)
+
 
 # ── DI container: static run-dependencies (Choice B -- Runtime static context) ──
 @dataclass
@@ -66,6 +69,11 @@ class AgentContext:
     allowed_tickers: frozenset[str]  # DB-derived allowlist (companies table) -- input-rail gate
     breaker: SynthesisCircuitBreaker  # S14: guards the Groq synthesis stream, built at cold-start
     embedder: EmbeddingClient  # S15 (D4): jina-v3 query embeddings, cold-start built
+    ticker_roster: Mapping[str, str]  # S16 (D3a): ticker->name, grounds Plan resolution
+    # Plan year-rail bounds (config-derived at cold-start). Routed through the context, like
+    # allowed_tickers/ticker_roster, so every Plan rail reads its gate set from one place.
+    corpus_min_year: int
+    corpus_max_year: int
 
 
 # Every node conforms to this shape -> S16 wiring is uniform.
@@ -80,6 +88,50 @@ def validate_tickers(requested: list[str], allowed: frozenset[str]) -> tuple[lis
     """
     kept = [t for t in requested if t in allowed]
     dropped = [t for t in requested if t not in allowed]
+    return kept, dropped
+
+
+def split_concatenated_years(requested: list[int]) -> list[int]:
+    """Repair years the LLM concatenated into one integer: 20232024 -> [2023, 2024].
+
+    The model has been observed emitting "2023 vs 2024" as the single int 20232024 even at
+    temperature 0, under strict constrained decoding, and with an explicit negative example in
+    the system prompt naming that exact wrong value. The prompt is only a nudge; this is the
+    deterministic repair, and it is the load-bearing half.
+
+    A value whose digit-length is a multiple of 4 and > 4 is split into successive 4-digit
+    years. Anything else -- a normal 4-digit year, or genuinely malformed garbage whose length
+    is not a multiple of 4 -- passes through untouched for ``validate_years`` to drop and flag.
+    Runs UPSTREAM of that gate so a repaired, in-bounds year reaches retrieval normally.
+    """
+    repaired: list[int] = []
+    for y in requested:
+        digits = str(y)
+        # isdigit() also rejects negatives (str() carries the sign), leaving them for the gate.
+        if digits.isdigit() and len(digits) > 4 and len(digits) % 4 == 0:
+            parts = [int(digits[i : i + 4]) for i in range(0, len(digits), 4)]
+            _log.warning("Plan emitted concatenated year %d; repaired to %s", y, parts)
+            repaired.extend(parts)
+        else:
+            repaired.append(y)
+    # Order-preserving dedup: the repair can create duplicates ([2023, 20232024] -> 2023 twice),
+    # and each dup year multiplies the retrieval fan-out. Mirrors retrieve_node's sub_question
+    # dedup below.
+    return list(dict.fromkeys(repaired))
+
+
+def validate_years(
+    requested: list[int], *, min_year: int, max_year: int
+) -> tuple[list[int], list[int]]:
+    """Split planned years into (kept, dropped) against the corpus year bounds.
+
+    The twin of ``validate_tickers``: the prompt only *guides* the LLM; this is the HARD gate.
+    Catches structured-decoding garbage -- notably the observed concatenation of "2023 vs 2024"
+    into the single integer 20232024 -- before it reaches retrieval, where an implausible year
+    matches zero rows and degrades into a false "no coverage" answer.
+    """
+    kept = [y for y in requested if min_year <= y <= max_year]
+    dropped = [y for y in requested if not (min_year <= y <= max_year)]
     return kept, dropped
 
 
@@ -99,20 +151,43 @@ def compute_coverage_gaps(plan: QueryPlan, reranked: list[ScoredChunk]) -> list[
 
 # ── Node 1: Plan -- LLM decompose + input-rail ───────────────────────────────
 async def plan_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[str, Any]:
-    structured = runtime.context.llm.with_structured_output(
+    # temperature=0 pinned INVARIANTLY here (S16/D-temp) -- constrained/structured decoding
+    # depends on it and must NOT track the config-driven synthesis temperature. model_copy sets
+    # a real attribute on a real ChatGroq instance (no reliance on a call-kwarg propagating
+    # through the with_structured_output RunnableSequence); the shared context.llm is untouched.
+    deterministic = runtime.context.llm.model_copy(update={"temperature": 0.0})
+    structured = deterministic.with_structured_output(
         QueryPlan,
         method="json_schema",
         strict=True,  # D3: constrained decoding
     )
     messages = [
-        # system prompt is FIXED (allowlist baked, identical every call) -> Groq caches it
-        ("system", build_plan_system_prompt(runtime.context.allowed_tickers)),
+        # system prompt is FIXED (roster baked, identical every call) -> Groq caches it
+        (
+            "system",
+            build_plan_system_prompt(
+                runtime.context.allowed_tickers, runtime.context.ticker_roster
+            ),
+        ),
         ("human", build_plan_user_msg(state["original_query"])),
     ]
     plan = cast(QueryPlan, await structured.ainvoke(messages))
     kept, dropped = validate_tickers(plan.tickers, runtime.context.allowed_tickers)
     plan.tickers = kept  # drop-and-note (partial-query policy)
-    return {"query_plan": plan, "unavailable_tickers": dropped}
+    # Repair concatenated years BEFORE the bounds gate: a repaired, in-bounds year must flow to
+    # retrieval normally rather than be dropped as garbage.
+    repaired = split_concatenated_years(plan.time_range.years)
+    kept_years, dropped_years = validate_years(
+        repaired,
+        min_year=runtime.context.corpus_min_year,
+        max_year=runtime.context.corpus_max_year,
+    )
+    plan.time_range.years = kept_years  # drop-and-note -- same rail pattern as tickers
+    return {
+        "query_plan": plan,
+        "unavailable_tickers": dropped,
+        "unavailable_years": dropped_years,
+    }
 
 
 # ── Node 2: Retrieve -- per-cell fan-out hybrid retrieval (S15) ──────────────
@@ -351,7 +426,9 @@ async def evaluate_node(state: AgentState, runtime: Runtime[AgentContext]) -> di
     if gaps:  # structural signal wins (precedence) -- LLM call skipped (token saving)
         return {"confidence": "low", "confidence_reason": "coverage", "coverage_gaps": gaps}
 
-    structured = runtime.context.llm.with_structured_output(
+    # temperature=0 pinned INVARIANTLY (S16/D-temp), same rationale as plan_node.
+    deterministic = runtime.context.llm.model_copy(update={"temperature": 0.0})
+    structured = deterministic.with_structured_output(
         EvalVerdict,
         method="json_schema",
         strict=True,  # D3
@@ -391,6 +468,7 @@ async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> 
                 reranked=state["reranked_chunks"],
                 confidence=state["confidence"],
                 unavailable_tickers=state["unavailable_tickers"],
+                unavailable_years=state["unavailable_years"],
             ),
         ),
     ]

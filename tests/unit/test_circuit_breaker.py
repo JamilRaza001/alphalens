@@ -370,6 +370,9 @@ async def test_synthesize_node_routes_open_breaker_to_degraded() -> None:
         allowed_tickers=frozenset({"AAPL"}),
         breaker=breaker,
         embedder=cast(EmbeddingClient, object()),  # unused by synthesize; satisfies the field
+        ticker_roster={},  # unused by synthesize; satisfies the field
+        corpus_min_year=2021,  # unused by synthesize; satisfies the field
+        corpus_max_year=2026,
     )
     reranked = [
         ScoredChunk(
@@ -392,6 +395,7 @@ async def test_synthesize_node_routes_open_breaker_to_degraded() -> None:
             "user_id": None,
             "query_plan": None,
             "unavailable_tickers": [],
+            "unavailable_years": [],
             "query": "q",
             "iteration": 0,
             "retrieved_chunks": [],

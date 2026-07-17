@@ -91,6 +91,9 @@ def _ctx(*, embedder: Any, pool: Any) -> AgentContext:
         allowed_tickers=frozenset({"AAPL", "MSFT"}),
         breaker=cast(Any, object()),
         embedder=cast(EmbeddingClient, embedder),
+        ticker_roster={},  # unused by retrieve_node
+        corpus_min_year=2021,  # unused by retrieve_node (the year-rail runs in plan_node)
+        corpus_max_year=2026,
     )
 
 
@@ -107,6 +110,7 @@ def _state(plan: QueryPlan) -> AgentState:
         "user_id": None,
         "query_plan": plan,
         "unavailable_tickers": [],
+        "unavailable_years": [],
         "query": "q",
         "iteration": 0,
         "retrieved_chunks": [],

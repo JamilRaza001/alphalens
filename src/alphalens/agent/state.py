@@ -39,10 +39,16 @@ class TimeRange(BaseModel):
 
     # "2022 vs 2024" -> [2022, 2024]; 2023 intentionally absent. A naive
     # range(start, end) would over-require 2023 and create false coverage gaps.
+    # The "never concatenate" clause is not hypothetical: the model was observed emitting
+    # [20232024] for "2023 vs 2024", which matches zero filings. nodes.validate_years is the
+    # hard gate; this description is only the soft guide.
     years: list[int] = Field(
         description=(
-            "Discrete list of the exact reporting years named in the query, e.g. "
-            "'2022 vs 2024' -> [2022, 2024]. Do NOT fill in intermediate years."
+            "Discrete list of the exact reporting years named in the query, as separate "
+            "4-digit integers -- ONE list entry per year. E.g. '2023 vs 2024' -> [2023, 2024]. "
+            "NEVER concatenate two years into a single number: [20232024] is WRONG. "
+            "Do NOT fill in intermediate years: '2022 vs 2024' -> [2022, 2024], not "
+            "[2022, 2023, 2024]."
         )
     )
 
@@ -138,6 +144,12 @@ class AgentState(TypedDict):
     # are in-corpus (ticker, year) cells that retrieval MISSED (post-rerank).
     # No reducer -- replaced. Surfaced by Synthesize's honesty-rail.
     unavailable_tickers: list[str]
+    # Requested years dropped by the Plan year-rail because they are not plausible corpus
+    # years -- e.g. the LLM concatenating "2023 vs 2024" into 20232024. Pre-retrieval, the
+    # exact twin of unavailable_tickers; distinct from coverage_gaps, which are in-corpus
+    # (ticker, year) cells that retrieval MISSED. No reducer -- replaced. Surfaced by
+    # Synthesize's honesty-rail.
+    unavailable_years: list[int]
 
     # -- Mutable per pass --
     query: str  # == original_query in v1 (v3 Refine rewrites it -- L6)

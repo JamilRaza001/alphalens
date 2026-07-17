@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     neon_database_url: SecretStr
     neon_direct_url: SecretStr
 
+    # ── Agent DB pool (S16) ───────────────────────────────────────────────────
+    # The agent asyncpg pool endpoint. Defaults to the POOLED URL (neon_database_url) —
+    # mirroring the ETL runner, which runs prepared-statements-ON + init=register_pgvector on
+    # the pooled endpoint live (S16/D-endpoint). Env AGENT_DB_URL overrides for a scale-flip
+    # (e.g. to the direct endpoint) with zero code change. See _default_agent_db_url below.
+    agent_db_url: SecretStr | None = None
+    agent_pool_min_size: int = 1
+    agent_pool_max_size: int = 5
+
     # ── Cloudflare R2 ─────────────────────────────────────────────────────────
     r2_account_id: str
     r2_access_key_id: SecretStr
@@ -45,6 +54,10 @@ class Settings(BaseSettings):
     # ── LLM — Groq (L8) ───────────────────────────────────────────────────────
     groq_api_key: SecretStr
     groq_model: str = "llama-3.3-70b-versatile"
+    # Synthesize-node temperature ONLY (S16/D-temp). Plan + Evaluate pin temperature=0
+    # invariantly at their call sites (structured decoding depends on it, S13 lock) and ignore
+    # this value. Default 0.0 → deterministic v1 synthesis; env GROQ_TEMPERATURE tunes it.
+    groq_temperature: float = 0.0
 
     # ── Embeddings — Jina primary (L17, L18) ──────────────────────────────────
     jina_api_key: SecretStr
@@ -73,6 +86,14 @@ class Settings(BaseSettings):
     retrieval_k_lexical: int = 20  # ts_rank_cd candidates fetched per cell (before fusion)
     retrieval_rrf_c: int = 60  # RRF smoothing constant in 1/(c + rank); standard, not tuned per-run
     retrieval_n_per_cell: int = 10  # RRF survivors kept per cell → merge
+
+    # ── Corpus year bounds (Plan year-rail) ───────────────────────────────────
+    # Hard gate on Plan's time_range.years: rejects implausible years — notably the observed
+    # concatenation of "2023 vs 2024" into the single integer 20232024 — before they reach
+    # retrieval, where an implausible year matches zero rows and degrades into a false
+    # empty-coverage answer. Env: CORPUS_MIN_YEAR / CORPUS_MAX_YEAR — bump as new filings land.
+    corpus_min_year: int = 2021
+    corpus_max_year: int = 2026
 
     # ── Synthesis circuit breaker (L8, S14) ───────────────────────────────────
     breaker_failure_threshold: int = (
@@ -138,6 +159,27 @@ class Settings(BaseSettings):
                 "pgvector schema is VECTOR(768) — see locked decision L17"
             )
         return v
+
+    @model_validator(mode="after")
+    def _default_agent_db_url(self) -> Settings:
+        """Default the agent pool endpoint to the POOLED URL when AGENT_DB_URL is unset (S16).
+
+        Mirrors the ETL runner, which runs live on the pooled endpoint. Populated here so the
+        resolved DSN is a single source of truth; env AGENT_DB_URL still overrides.
+        """
+        if self.agent_db_url is None:
+            self.agent_db_url = self.neon_database_url
+        return self
+
+    @model_validator(mode="after")
+    def _validate_corpus_year_bounds(self) -> Settings:
+        """Enforce a non-empty corpus year window — an inverted range would drop every year."""
+        if self.corpus_min_year > self.corpus_max_year:
+            raise ValueError(
+                f"corpus_min_year ({self.corpus_min_year}) must be <= corpus_max_year "
+                f"({self.corpus_max_year}); an inverted range rejects every planned year"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_tpm_safety_invariant(self) -> Settings:

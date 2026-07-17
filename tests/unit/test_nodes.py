@@ -26,9 +26,12 @@ from alphalens.agent.nodes import (
     compute_coverage_gaps,
     evaluate_node,
     plan_node,
+    plan_to_cells,
     rerank_node,
+    split_concatenated_years,
     synthesize_node,
     validate_tickers,
+    validate_years,
 )
 from alphalens.agent.state import (
     AgentState,
@@ -75,6 +78,11 @@ class _FakeLLM:
         self.structured_calls: list[Any] = []
         self.with_structured_output_kwargs: dict[str, Any] | None = None
 
+    def model_copy(self, *, update: dict[str, Any] | None = None) -> _FakeLLM:
+        # S16/D-temp: plan_node/evaluate_node call model_copy(update={"temperature": 0.0})
+        # before with_structured_output. Return self so structured-call recording survives.
+        return self
+
     def with_structured_output(self, schema: Any, **kwargs: Any) -> _FakeStructured:
         self.with_structured_output_kwargs = kwargs
         return _FakeStructured(self._structured_result, self.structured_calls)
@@ -108,6 +116,8 @@ def _ctx(
     allowed: frozenset[str] = _ALLOWED,
     breaker: SynthesisCircuitBreaker | None = None,
     embedder: Any = None,
+    corpus_min_year: int = 2021,
+    corpus_max_year: int = 2026,
 ) -> AgentContext:
     # Fakes stand in for the real deps; cast to satisfy AgentContext's typed fields.
     return AgentContext(
@@ -121,6 +131,11 @@ def _ctx(
         else SynthesisCircuitBreaker(failure_threshold=3, reset_timeout_seconds=30.0),
         # retrieve_node is exercised in test_retrieve_node.py; a stand-in suffices here.
         embedder=cast(EmbeddingClient, embedder if embedder is not None else object()),
+        ticker_roster={t: t for t in allowed},  # S16: roster keys mirror the allowlist
+        # Plan year-rail bounds: injected here (not read from env) so the rail's tests are
+        # independent of the deployed corpus window.
+        corpus_min_year=corpus_min_year,
+        corpus_max_year=corpus_max_year,
     )
 
 
@@ -156,6 +171,7 @@ def _state(**overrides: Any) -> AgentState:
         "user_id": None,
         "query_plan": _plan(["AAPL"], [2023]),
         "unavailable_tickers": [],
+        "unavailable_years": [],
         "query": "How did AAPL revenue trend?",
         "iteration": 0,
         "retrieved_chunks": [],
@@ -177,6 +193,47 @@ def test_validate_tickers_split() -> None:
     kept, dropped = validate_tickers(["AAPL", "TSLA", "MSFT"], _ALLOWED)
     assert kept == ["AAPL", "MSFT"]
     assert dropped == ["TSLA"]
+
+
+def test_split_concatenated_years_repairs_pair() -> None:
+    # The exact live failure: "2023 vs 2024" decoded as one integer.
+    assert split_concatenated_years([20232024]) == [2023, 2024]
+
+
+def test_split_concatenated_years_repairs_triple() -> None:
+    assert split_concatenated_years([202320242025]) == [2023, 2024, 2025]
+
+
+def test_split_concatenated_years_passes_clean_years() -> None:
+    # Already-correct output must survive the repair untouched.
+    assert split_concatenated_years([2023, 2024]) == [2023, 2024]
+
+
+def test_split_concatenated_years_leaves_unrepairable() -> None:
+    # 5 digits -- not a multiple of 4, so not a concatenation. Left for validate_years to drop.
+    assert split_concatenated_years([12345]) == [12345]
+    kept, dropped = validate_years([12345], min_year=2021, max_year=2026)
+    assert kept == []
+    assert dropped == [12345]
+
+
+def test_split_concatenated_years_dedups_order_preserving() -> None:
+    # The repair can CREATE duplicates; a dup year would multiply the retrieval fan-out.
+    assert split_concatenated_years([2023, 20232024]) == [2023, 2024]
+
+
+def test_validate_years_split() -> None:
+    # 20232024 is the real observed failure: the LLM concatenating "2023 vs 2024" into one int.
+    # 1999 is plausibly-shaped but outside the corpus window -- both are dropped.
+    kept, dropped = validate_years([20232024, 2023, 1999], min_year=2021, max_year=2026)
+    assert kept == [2023]
+    assert dropped == [20232024, 1999]
+
+
+def test_validate_years_boundaries_inclusive() -> None:
+    kept, dropped = validate_years([2021, 2026, 2020, 2027], min_year=2021, max_year=2026)
+    assert kept == [2021, 2026]  # bounds are inclusive
+    assert dropped == [2020, 2027]
 
 
 def test_compute_coverage_gaps_missing_cell() -> None:
@@ -210,12 +267,46 @@ async def test_plan_node_drops_unavailable() -> None:
     ctx = _ctx(llm=llm)
     out = await plan_node(_state(), _runtime(ctx))
 
-    assert set(out.keys()) == {"query_plan", "unavailable_tickers"}  # partial update only
+    # partial update only
+    assert set(out.keys()) == {"query_plan", "unavailable_tickers", "unavailable_years"}
     assert out["query_plan"].tickers == ["AAPL"]  # dropped TSLA
     assert all(t in _ALLOWED for t in out["query_plan"].tickers)
     assert out["unavailable_tickers"] == ["TSLA"]
     # D3/D4: strict json_schema constrained decoding requested.
     assert llm.with_structured_output_kwargs == {"method": "json_schema", "strict": True}
+
+
+async def test_plan_node_drops_malformed_year() -> None:
+    # Retargeted: 20232024 is now REPAIRED (see test_plan_node_repairs_concatenated_year), so
+    # the drop-and-flag path is exercised with genuinely unrepairable garbage -- 5 digits, not
+    # a multiple of 4, so the repair leaves it for the rail to drop and surface.
+    llm = _FakeLLM(structured_result=_plan(["AAPL"], [12345]))
+    out = await plan_node(_state(), _runtime(_ctx(llm=llm)))
+
+    assert out["query_plan"].time_range.years == []  # dropped
+    assert out["unavailable_years"] == [12345]  # and surfaced, not swallowed
+
+
+async def test_plan_node_repairs_concatenated_year() -> None:
+    # The live bug, end to end: the model emits [20232024]; the repair must turn that into two
+    # real years that reach retrieval, with nothing flagged -- i.e. the user gets a real answer
+    # instead of an honest "no coverage".
+    llm = _FakeLLM(structured_result=_plan(["AAPL"], [20232024]))
+    out = await plan_node(_state(), _runtime(_ctx(llm=llm)))
+
+    assert out["query_plan"].time_range.years == [2023, 2024]  # repaired, in bounds
+    assert out["unavailable_years"] == []  # nothing dropped -- the query now works
+    # ...and both years actually reach cell-building (the fan-out retrieval consumes).
+    assert plan_to_cells(out["query_plan"]) == [("AAPL", 2023, "q"), ("AAPL", 2024, "q")]
+
+
+async def test_plan_node_keeps_valid_years() -> None:
+    # The correctly-decoded form of the same query passes through untouched.
+    llm = _FakeLLM(structured_result=_plan(["AAPL"], [2023, 2024]))
+    out = await plan_node(_state(), _runtime(_ctx(llm=llm)))
+
+    assert out["query_plan"].time_range.years == [2023, 2024]
+    assert out["unavailable_years"] == []
 
 
 # ── Retrieve node: real per-cell fan-out lives in test_retrieve_node.py (S15) ──
