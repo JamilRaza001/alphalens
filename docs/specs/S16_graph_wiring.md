@@ -30,17 +30,27 @@ cold-start resource assembly \*\*and pool-lifecycle owner\*\*. \*Why:\* module-l
 
 \`import\` = DB connect + 80 MB reranker load; the split turns cold-start into one named, testable seam.
 
-2\. \*\*D1(b) — Agent pool = DIRECT endpoint + \`init=register\_pgvector\`\*\*, \`min\_size=1\`, \`max\_size=5\`,
+2\. \*\*D1(b) — Agent pool = POOLED endpoint + \`init=register\_pgvector\`\*\* \*\*(re-locked post-G1)\*\*, \`min\_size=1\`,
 
-\*\*prepared statements ON\*\* (no \`statement\_cache\_size=0\`). Endpoint is \*\*config-driven\*\* (\`agent\_db\_url\`)
+\`max\_size=5\`, \*\*prepared statements ON\*\* (no \`statement\_cache\_size=0\`). Endpoint is \*\*config-driven\*\*
 
-so a future scale-flip to pooled + \`statement\_cache\_size=0\` is an \*\*env change, zero code change\*\*.
+(\`agent\_db\_url\`, defaulting to \`neon\_database\_url\`) so a future scale-flip to the direct endpoint is an
 
-\*Why:\* AlphaLens is ~30–45 queries/day at \`max\_size=5\` — asyncpg's own pool on the direct endpoint
+\*\*env change, zero code change\*\*.
 
-beats a PgBouncer path (whose prepared-statement trap + pgvector-OID indirection buy nothing here).
+\*Why (re-locked):\* this spec originally locked the \*\*direct\*\* endpoint, on the assumption that the ETL
 
-The ETL runner already runs this exact shape live → \*\*mirror it\*\* (see Gotcha G1 — verify, don't assume).
+runner used it. \*\*G1 executed as step 1 and falsified that\*\*: \`etl/runner.py\` runs \*\*pooled\*\*, prepared
+
+statements ON, \`init=register\_pgvector\` — live, at 151/151 filings. Per G1's own instruction ("if the
+
+runner is pooled, that is the signal to reconcile D1b, not to assume") the agent mirrors the runner, which
+
+also restores consistency with \*\*L12\*\* ("Neon Pooled URL for app, Direct URL for Alembic migrations").
+
+The feared PgBouncer prepared-statement trap does not bite: the runner already proves the exact shape
+
+works live on the pooled endpoint.
 
 3\. \*\*D2 — Streaming = \`ainvoke()\` → drain \`final\_state\["answer\_stream"\]\` in the caller.\*\*
 
@@ -88,19 +98,47 @@ is \`@pytest.mark.live\` and \*\*excluded from default CI\*\*. \*Why:\* the firs
 
 free-form, non-deterministic); the script gives human-inspected proof, the test is a later regression net.
 
+7\. \*\*D-temp — \`temperature\` is split by node.\*\* The shared \`context.llm\` carries \`settings.groq\_temperature\`,
+
+which is the \*\*Synthesize-node temperature only\*\*. \`plan\_node\` and \`evaluate\_node\` re-pin \`temperature=0\`
+
+\*\*invariantly\*\* at their own call sites via \`llm.model\_copy(update={"temperature": 0.0})\`, ignoring the config
+
+value entirely. \*Why:\* structured/constrained decoding (\`with\_structured\_output(method="json\_schema",
+
+strict=True)\`) depends on temp-0 and must \*\*not\*\* track a config knob someone tunes for synthesis prose.
+
+\`model\_copy\` sets a real attribute on a real \`ChatGroq\` instance — it does not rely on a call-kwarg
+
+propagating through the \`with\_structured\_output\` \`RunnableSequence\` — and leaves the shared \`context.llm\`
+
+untouched. (Code refers to this as \`S16/D-temp\`.)
+
+8\. \*\*D-endpoint\*\* — the config-driven pool endpoint; see \*\*D1(b) (re-locked post-G1)\*\* above, which it
+
+names in code (\`S16/D-endpoint\`).
+
 \---
 
 \## Piggyback additions (applied alongside S16)
 
-\- \*\*\`config.py\`\*\* — \`agent\_db\_url: SecretStr\` (defaults to \`neon\_direct\_url\` via validator; env \`AGENT\_DB\_URL\`
+\- \*\*\`config.py\`\*\* — \`agent\_db\_url: SecretStr | None = None\` (defaults to \`neon\_database\_url\` — the \*\*POOLED\*\*
 
-overrides for the scale-flip), \`agent\_pool\_min\_size: int = 1\`, \`agent\_pool\_max\_size: int = 5\`.
+URL — via the \`\_default\_agent\_db\_url\` validator; env \`AGENT\_DB\_URL\` overrides for the scale-flip),
 
-\- \*\*\`nodes.py\`\*\* — extend \`AgentContext\` with \`ticker\_roster: Mapping\[str, str\]\` (NEW, S16/D3a). This is the
+\`agent\_pool\_min\_size: int = 1\`, \`agent\_pool\_max\_size: int = 5\`. \*\*(re-locked post-G1)\*\*
 
-4th cumulative extension after S14 (\`breaker\`) and S15 (\`embedder\`); the dataclass now holds
+\- \*\*\`nodes.py\`\*\* — extend \`AgentContext\` with \`ticker\_roster: Mapping\[str, str\]\` (NEW, S16/D3a), plus
 
-\`llm, reranker, pool, allowed\_tickers, breaker, embedder, ticker\_roster\`.
+\`corpus\_min\_year: int\` / \`corpus\_max\_year: int\` (the Plan year-rail's gate set — see the year-rail
+
+piggyback below). Cumulative extensions after S14 (\`breaker\`) and S15 (\`embedder\`); the dataclass now holds
+
+\*\*9 fields\*\*: \`llm, reranker, pool, allowed\_tickers, breaker, embedder, ticker\_roster, corpus\_min\_year,
+
+corpus\_max\_year\`. Rails read their gate set from the context; per-node tuning knobs still read
+
+\`get\_settings()\` inline (as \`retrieve\_node\` / \`rerank\_node\` do).
 
 \- \*\*\`prompts.py\`\*\* — extend \`build\_plan\_system\_prompt(allowed\_tickers, ticker\_roster)\` to bake the ticker→name
 
@@ -112,11 +150,67 @@ map into the (still byte-stable, cache-friendly) system prompt.
 
 \---
 
+\## Plan year-rail + concatenation repair (added post-live-run, same commit \`482f37b\`)
+
+\*\*Why:\* the first live run (D4/AC13, "Compare Apple aur Microsoft R&D spend 2023 vs 2024") returned a
+
+\*\*false "no coverage"\*\* answer. Root cause was \*\*not\*\* retrieval: \`plan\_node\` emitted
+
+\`time\_range.years = \[20232024\]\` — the two years concatenated into one integer — which matches zero rows.
+
+Diagnosis proved retrieval/RRF/the \`$1::vector\` binding all healthy; the system was behaving \*correctly on a
+
+garbage plan\*. The model produced this at \*\*temperature 0 under \`strict=True\`\*\*, with an explicit negative
+
+example already in the system prompt — so the prompt is treated as a nudge and the deterministic code is
+
+load-bearing. This mirrors the ticker rail's \*\*soft-guide + hard-gate\*\* split.
+
+\- \*\*\`config.py\`\*\* — \`corpus\_min\_year: int = 2021\`, \`corpus\_max\_year: int = 2026\` (env \`CORPUS\_MIN\_YEAR\` /
+
+\`CORPUS\_MAX\_YEAR\`; bump as new filings land), guarded by a \`\_validate\_corpus\_year\_bounds\` model-validator
+
+that rejects an inverted range. Routed to nodes via \`AgentContext\` (not \`get\_settings()\` mid-node) so every
+
+Plan rail reads its gate set from one place.
+
+\- \*\*\`nodes.py\`\*\* — \`split\_concatenated\_years(requested) -> list\[int\]\` (repair) and
+
+\`validate\_years(requested, \*, min\_year, max\_year) -> tuple\[kept, dropped\]\` (gate, shaped exactly like
+
+\`validate\_tickers\`). \`plan\_node\` runs \*\*repair BEFORE gate\*\*: a value whose digit-length is \`> 4\` and a
+
+\*\*multiple of 4\*\* splits into successive 4-digit years (order-preserving dedup, WARNING-logged); anything
+
+else passes through untouched for the gate to drop-and-flag. Repaired + in-bounds ⇒ retrieval runs normally.
+
+\- \*\*\`state.py\`\*\* — new \`unavailable\_years: list\[int\]\` key (no reducer — replaced), the exact twin of
+
+\`unavailable\_tickers\`: \*\*pre-retrieval\*\* drops, distinct from \`coverage\_gaps\` (in-corpus cells retrieval
+
+MISSED). \`TimeRange.years\` \`Field(description=...)\` strengthened (soft guide only).
+
+\- \*\*\`prompts.py\`\*\* — Plan template states one-element-per-year + a stark negative example; \`{roster}\` remains
+
+the \*\*only\*\* interpolation (Groq cache byte-stability). \`build\_synthesize\_user\_msg\` takes
+
+\`unavailable\_years\` and \`SYNTHESIZE\_SYSTEM\_PROMPT\` surfaces it clause-parallel to \`unavailable\_tickers\`.
+
+\*\*Known, accepted (flagged not fixed):\*\* if \*all\* years are dropped, \`years=\[\]\` makes
+
+\`compute\_coverage\_gaps\`' \`needed\` set vacuously empty ⇒ gaps \`\[\]\` ⇒ Evaluate falls to the LLM branch and
+
+lands \`confidence\_reason="llm"\`, not \`"coverage"\`. Identical to the existing all-tickers-dropped path —
+
+left consistent rather than special-cased.
+
+\---
+
 \## Goal
 
 Wire the five already-built, decoupled nodes (Plan → Retrieve → Rerank → Evaluate → Synthesize) into one
 
-\*\*linear, single-pass LangGraph 1.0 \`StateGraph\`\*\* — no conditional edges, no Refine loop, no checkpointer —
+\*\*linear, single-pass LangGraph 1.x \`StateGraph\`\*\* (installed: \*\*1.2.1\*\*) — no conditional edges, no Refine loop, no checkpointer —
 
 and assemble the \`AgentContext\` those nodes depend on \*\*once at cold-start\*\*. Topology (\`graph.py\`) is kept
 
@@ -154,13 +248,13 @@ plan\_node, retrieve\_node, rerank\_node, evaluate\_node, synthesize\_node, # G5
 
 )
 
-def build\_graph() -> CompiledStateGraph:
+def build\_graph() -> CompiledStateGraph\[AgentState, AgentContext, AgentState, AgentState\]:
 
 """Wire the 5 nodes into a linear single-pass graph and compile WITHOUT a checkpointer.
 
 Pure topology: no DB, no await, no resource construction — importing this module is side-effect-free.
 
-\`context\_schema=AgentContext\` (LangGraph 1.0 — NOT the deprecated \`config\_schema\`) declares the DI shape;
+\`context\_schema=AgentContext\` (LangGraph 1.x — NOT the deprecated \`config\_schema\`) declares the DI shape;
 
 deps are injected later at \`graph.ainvoke(..., context=ctx)\`."""
 
@@ -218,13 +312,17 @@ from alphalens.etl.upsert import register\_pgvector # S9 — REUSE, do NOT reimp
 
 async def build\_agent\_pool(settings: Settings) -> Pool:
 
-"""Create the agent asyncpg pool on the DIRECT Neon endpoint with the pgvector codec registered on
+"""Create the agent asyncpg pool on the POOLED Neon endpoint with the pgvector codec registered on
 
-EVERY new connection via \`init\` (D1b). MIRRORS etl/runner.py pool construction — verify first (G1)."""
+EVERY new connection via \`init\` (D1b, re-locked post-G1). MIRRORS etl/runner.py pool construction —
 
-return await asyncpg.create\_pool(
+G1 verified live: pooled, prepared statements ON, no statement\_cache\_size=0."""
 
-dsn=settings.agent\_db\_url.get\_secret\_value(),
+dsn = (settings.agent\_db\_url or settings.neon\_database\_url).get\_secret\_value()
+
+pool: Pool = await asyncpg.create\_pool(
+
+dsn, # POSITIONAL (mirrors etl/runner.py), not dsn=
 
 min\_size=settings.agent\_pool\_min\_size, # 1
 
@@ -234,7 +332,9 @@ init=register\_pgvector, # list\[float\] -> $1::vector (G2)
 
 )
 
-async def load\_ticker\_universe(pool: Pool) -> tuple\[frozenset\[str\], Mapping\[str, str\]\]:
+return pool
+
+async def load\_ticker\_universe(pool: Pool) -> tuple\[frozenset\[str\], dict\[str, str\]\]:
 
 """One cold-start query on \`companies\` → (allowed\_tickers, ticker\_roster) (D3a).
 
@@ -260,13 +360,33 @@ pool = await build\_agent\_pool(settings)
 
 allowed\_tickers, ticker\_roster = await load\_ticker\_universe(pool)
 
-llm = ChatGroq(model=settings.groq\_model) # per-call temp=0 already set inside Plan/Evaluate (S13)
+\# G6 RESOLVED — the shapes below are the VERIFIED constructors, not assumptions.
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2") # L3/L14, ~80 MB — confirm S13/S14 load path
+llm = ChatGroq(
 
-embedder = EmbeddingClient(settings=settings) # G6: confirm S8 constructor deps
+model\_name=settings.groq\_model, # field name (alias "model"); mypy wants the field name
 
-breaker = SynthesisCircuitBreaker(settings=settings) # G6: confirm S14 constructor deps
+api\_key=settings.groq\_api\_key.get\_secret\_value(), # explicit (G6): pydantic-settings loads .env
+
+# into Settings, NOT os.environ — ChatGroq's
+
+# GROQ\_API\_KEY env fallback is not guaranteed
+
+temperature=settings.groq\_temperature, # SYNTHESIZE temp only; Plan/Evaluate re-pin 0 (D-temp)
+
+)
+
+reranker = CrossEncoder(settings.reranker\_model) # L3/L14, ~80 MB — config-driven, baked at build time
+
+embedder = EmbeddingClient(settings) # G6: positional, mirrors etl/runner
+
+breaker = SynthesisCircuitBreaker( # G6: real ctor — NOT settings=
+
+failure\_threshold=settings.breaker\_failure\_threshold,
+
+reset\_timeout\_seconds=settings.breaker\_reset\_timeout\_seconds,
+
+)
 
 ctx = AgentContext(
 
@@ -275,6 +395,10 @@ llm=llm, reranker=reranker, pool=pool,
 allowed\_tickers=allowed\_tickers, breaker=breaker,
 
 embedder=embedder, ticker\_roster=ticker\_roster, # NEW field (S16/D3a)
+
+corpus\_min\_year=settings.corpus\_min\_year, # year-rail gate set
+
+corpus\_max\_year=settings.corpus\_max\_year,
 
 )
 
@@ -348,6 +472,8 @@ f"\\nconfidence={final\_state\['confidence'\]} reason={final\_state\['confidence
 
 f"unavailable={final\_state\['unavailable\_tickers'\]} "
 
+f"unavailable\_years={final\_state\['unavailable\_years'\]} " # year-rail surfacing
+
 f"latency={time.monotonic() - t0:.2f}s"
 
 )
@@ -376,7 +502,7 @@ main()
 
 \`\`\`python
 
-\# ── tests/agent/test\_graph.py ── D1a topology test · PURE, no resources ──
+\# ── tests/unit/test\_graph.py ── D1a topology test · PURE, no resources ──
 
 def test\_build\_graph\_topology() -> None:
 
@@ -414,15 +540,17 @@ every plan ticker ∈ allowed\_tickers, status ∈ {ok, degraded}. Written after
 
 3\. \*\*No checkpointer (D1/D2).\*\* The graph is compiled \*\*without\*\* a checkpointer (v1 stateless single-pass).
 
-4\. \*\*LangGraph 1.0 API.\*\* Construction uses \`StateGraph(AgentState, context\_schema=AgentContext)\` — the
+4\. \*\*LangGraph 1.x API\*\* (installed: \*\*1.2.1\*\*)\*\*.\*\* Construction uses \`StateGraph(AgentState, context\_schema=AgentContext)\` — the
 
 deprecated \`config\_schema\` does \*\*not\*\* appear anywhere. Deps reach nodes only via \`ainvoke(..., context=ctx)\`.
 
-5\. \*\*Pool construction (D1b).\*\* \`build\_agent\_pool\` creates the pool on \`settings.agent\_db\_url\` (direct) with
+5\. \*\*Pool construction (D1b, re-locked post-G1).\*\* \`build\_agent\_pool\` creates the pool on
 
-\`init=register\_pgvector\`, \`min\_size=1\`, \`max\_size=5\`, and \*\*no\*\* \`statement\_cache\_size=0\`. \`agent\_db\_url\`
+\`settings.agent\_db\_url\` (\*\*pooled\*\*) with \`init=register\_pgvector\`, \`min\_size=1\`, \`max\_size=5\`, and \*\*no\*\*
 
-defaults to \`neon\_direct\_url\` and is env-overridable.
+\`statement\_cache\_size=0\`. \`agent\_db\_url\` defaults to \`neon\_database\_url\` (the pooled URL, via the
+
+\`\_default\_agent\_db\_url\` validator) and is env-overridable via \`AGENT\_DB\_URL\`.
 
 6\. \*\*\`register\_pgvector\` reuse (D1b).\*\* The pool \`init\` is the \*\*S9\*\* \`register\_pgvector\` imported from
 
@@ -430,9 +558,9 @@ defaults to \`neon\_direct\_url\` and is env-overridable.
 
 7\. \*\*Cold-start seam (D1a).\*\* \`build\_context()\` returns \`(AgentContext, Pool)\`; the pool is returned separately
 
-and the caller (harness) closes it in a \`finally\`. All six S13/S14/S15 context fields plus the new
+and the caller (harness) closes it in a \`finally\`. All six S13/S14/S15 context fields plus \`ticker\_roster\`
 
-\`ticker\_roster\` are populated.
+and the two year-rail bounds are populated — \*\*9 fields total\*\*.
 
 8\. \*\*Ticker universe (D3a).\*\* \`load\_ticker\_universe\` issues exactly one \`SELECT ticker, name FROM companies\`
 
@@ -458,17 +586,41 @@ after the "--- ANSWER ---" banner, not during graph execution.
 
 12\. \*\*Harness output (D4).\*\* \`run\_query.py\` prints the streamed answer, the citations list, and a footer with
 
-\`confidence\`, \`confidence\_reason\`, \`unavailable\_tickers\`, and latency; it exits 0 on success and closes the
+\`confidence\`, \`confidence\_reason\`, \`unavailable\_tickers\`, \`unavailable\_years\`, and latency; it exits 0 on
 
-pool on every path.
+success and closes the pool on every path.
 
 13\. \*\*Live multi-cell proof (D4).\*\* The documented first run uses a ≥2-ticker × ≥2-year query (e.g. Apple vs
 
 Microsoft, 2023 vs 2024) so per-cell fan-out + RRF + join are actually exercised, and returns a cited answer.
 
+\*\*Status: MET, but only after the year-rail fix.\*\* The literal first run wired correctly end-to-end yet
+
+returned an honest-but-empty "no coverage" answer — see the year-rail section above; the pipeline itself
+
+(fan-out, RRF, join, binding) was proven healthy by the diagnosis and the re-run returns cited evidence.
+
 14\. \*\*Live test shape (D4).\*\* \`test\_agent\_end\_to\_end\_live\` is \`@pytest.mark.live\`, excluded from the default
 
 \`pytest\` run, and asserts only the structural invariants in its docstring — authored after the first live run.
+
+\*\*Status: TRACKED FOLLOW-UP — scaffold only; does NOT block S16 = DONE.\*\*
+
+\`tests/integration/test\_agent\_live.py\` exists with the correct marker, exclusion, and a docstring pinning
+
+the intended contract, but its body is a single
+
+\`pytest.skip("TODO(S16/D4/AC14): author structural assertions from the first live run")\`. The structural
+
+assertions are \*\*deliberately deferred\*\*: this spec's own D4 says the test is authored \*from an observed
+
+run\*, and the only runs observed so far are the year-concatenation failure and a \*\*ticker-skewed\*\* run
+
+(7 AAPL : 1 MSFT — the Lever-#1 retrieval-quality fix). Pinning invariants to either would bake a known-bad
+
+shape into the regression net. \*\*Author it from a representative run after the retrieval-quality fix
+
+lands.\*\* Until then the live path is proven by the harness + human inspection, with no regression net.
 
 15\. \*\*Gates.\*\* \`ruff\` clean, \`mypy --strict\` clean (incl. the new \`AgentContext.ticker\_roster\` field and the
 
@@ -478,15 +630,15 @@ Microsoft, 2023 vs 2024) so per-cell fan-out + RRF + join are actually exercised
 
 \## Gotchas (live-verify checkpoints — S28 discipline)
 
-\- \*\*G1 — Verify the ETL runner's ACTUAL endpoint before locking the agent default.\*\* Doc tension: S4 gotcha
+\- \*\*G1 — RESOLVED (and it fired).\*\* The original D1b locked the \*\*direct\*\* endpoint while S4's gotcha (L12)
 
-(L12) says "app code uses the \*\*pooled\*\* URL," but D1b locks the agent pool to the \*\*direct\*\* endpoint.
+said "app code uses the \*\*pooled\*\* URL". \`etl/runner.py\` was read as ground truth per this gotcha and is
 
-\`etl/runner.py\` (≈ line 133) is \*\*ground truth\*\* — read its exact \`create\_pool\` args (endpoint, \`init\`,
+\*\*pooled\*\*, prepared statements ON, \`init=register\_pgvector\`, \`min=1\`/\`max=5\`. Per this gotcha's own
 
-\`statement\_cache\_size\`, sizes) and \*\*mirror them\*\*. If the runner is pooled, that is the signal to reconcile
+instruction, \*\*D1b was reconciled to pooled\*\* rather than the runner being changed — see D1b (re-locked
 
-D1b, not to assume. \*\*Do this as S16 step 1.\*\* Assume nothing (S28 lesson).
+post-G1). This is the S28 "assume nothing" lesson paying out: the spec's assumption was wrong.
 
 \- \*\*G2 — \`register\_pgvector\` only surfaces on a LIVE run.\*\* It runs per-connection via the \`init\` callback;
 
@@ -506,15 +658,25 @@ closures hold \`reranked\_chunks\` + \`llm\` + messages; the pool must be open w
 
 \`ainvoke\` + drain inside one coroutine → safe. The future Lambda handler must do the same (one invocation).
 
-\- \*\*G5 — Confirm the installed LangGraph 1.0.x API surface.\*\* Exact \`CompiledStateGraph\` import path, the
+\- \*\*G5 — RESOLVED.\*\* Installed LangGraph is \*\*1.2.1\*\*. \`CompiledStateGraph\` imports from
 
-\`StateGraph(state, context\_schema=...)\` signature, \`ainvoke(..., context=ctx)\`, and the node function names
+\`langgraph.graph.state\` and is \*\*generic\*\* — the shipped annotation is
 
-in \`nodes.py\` (\`retrieve\_node\`/\`synthesize\_node\` confirmed; verify \`plan\_node\`/\`rerank\_node\`/\`evaluate\_node\`).
+\`CompiledStateGraph\[AgentState, AgentContext, AgentState, AgentState\]\` (a bare \`CompiledStateGraph\` does not
 
-\- \*\*G6 — Confirm constructor deps for \`EmbeddingClient\` (S8) and \`SynthesisCircuitBreaker\` (S14)\*\* before
+satisfy \`mypy --strict\`). \`StateGraph(state, context\_schema=...)\` and \`ainvoke(..., context=ctx)\` confirmed;
 
-wiring cold-start; the \`settings=\` shapes above are assumptions to verify.
+all five node names confirmed.
+
+\- \*\*G6 — RESOLVED (both assumptions were wrong).\*\* \`EmbeddingClient(settings)\` is \*\*positional\*\*, and
+
+\`SynthesisCircuitBreaker\` takes \*\*\`failure\_threshold=\` / \`reset\_timeout\_seconds=\`\*\*, \*\*not\*\* \`settings=\`.
+
+\`ChatGroq\` additionally needs \`model\_name=\` (the field name; \`model\` is its alias) and an \*\*explicit\*\*
+
+\`api\_key=\` — pydantic-settings loads \`.env\` into \`Settings\`, not \`os.environ\`, so ChatGroq's \`GROQ\_API\_KEY\`
+
+env fallback is not guaranteed at run time. See the corrected \`build\_context\` above.
 
 \- \*\*G7 — Mirror the ETL runner's teardown pattern\*\* (\`async with create\_pool(...)\` vs \`create\_pool(...)\` +
 

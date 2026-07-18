@@ -68,6 +68,9 @@ from alphalens.agent.prompts import (
 class AgentContext:
     """Immutable per-run dependencies, injected via LangGraph Runtime context.
     Constructed ONCE at app cold-start; passed by reference to graph.invoke(..., context=ctx)."""
+    # As of S13 — this list GROWS in later specs. Cumulative live shape (9 fields, as of S16):
+    # + breaker (S14), + embedder (S15), + ticker_roster / corpus_min_year / corpus_max_year (S16).
+    # nodes.py is ground truth; see docs/specs/S16_graph_wiring.md for the current list.
     llm: ChatGroq                    # Groq gpt-oss-120b (D2)
     reranker: CrossEncoder           # ms-marco-MiniLM-L-6-v2, startup-loaded (L3)
     pool: Pool                       # asyncpg pool (consumed by retrieve_node in S15)
@@ -106,8 +109,11 @@ async def plan_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[s
         QueryPlan, method="json_schema", strict=True          # D3: constrained decoding
     )
     messages = [
-        # system prompt is FIXED (allowlist baked, identical every call) → Groq caches it
-        ("system", build_plan_system_prompt(runtime.context.allowed_tickers)),
+        # system prompt is FIXED (roster baked, identical every call) → Groq caches it
+        # S16/D3a: now also passes runtime.context.ticker_roster (grounded resolution)
+        ("system", build_plan_system_prompt(
+            runtime.context.allowed_tickers, runtime.context.ticker_roster
+        )),
         ("human",  build_plan_user_msg(state["original_query"])),
     ]
     plan: QueryPlan = await structured.ainvoke(messages)
@@ -202,9 +208,13 @@ from alphalens.agent.state import ScoredChunk
 # System prompts are MODULE-LEVEL CONSTANTS (fixed strings) → cacheable by Groq.
 # Keep them stable; iterate deliberately (prompt diffs are the v1→v2 quality lever).
 
-def build_plan_system_prompt(allowed_tickers: frozenset[str]) -> str:
-    """Fixed instructions + the (static, v1) allowlist baked in → identical every call
-    → cache-friendly. The allowlist here only GUIDES the LLM; validate_tickers enforces."""
+# SUPERSEDED BY S16/D3a — now takes the ticker roster too; see docs/specs/S16_graph_wiring.md.
+def build_plan_system_prompt(
+    allowed_tickers: frozenset[str], ticker_roster: Mapping[str, str]
+) -> str:
+    """Fixed instructions + the (static, v1) corpus roster baked in → identical every call
+    → cache-friendly. The roster (ticker→name, rendered ticker-sorted for stability) GUIDES the
+    LLM and grounds word→ticker resolution; validate_tickers is still the hard gate."""
     ...
 
 def build_plan_user_msg(query: str) -> str: ...
@@ -243,7 +253,7 @@ def build_synthesize_user_msg(
 - **Coverage helper — two known traps.** (1) *Discrete years*: iterate `time_range.years` directly; never `range(min, max)` — that over-requires intermediate years and fabricates gaps. (2) *Cartesian false-low* (accepted v1): `needed` is a full ticker×year product, so asymmetric queries ("AAPL 2022 vs MSFT 2024") over-generate cells and may under-claim. Fixing this needs per-sub-question `(ticker,year)` pairing → **v2**.
 - **Reranker: load once, score off-thread.** The `CrossEncoder` is built at cold-start (L3, ~80MB) and lives on `AgentContext` — never re-instantiate inside the node. `.predict` is synchronous/CPU-bound; `asyncio.to_thread` keeps the event loop free (matters once fan-out makes the pipeline concurrent).
 - **Tool-call rail belongs to S15, but lock the rule now.** Retrieve's `WHERE` filters use LLM-derived `ticker`/`year`. In S15 these MUST go through **parameterized queries** (asyncpg `$1, $2` placeholders) — never f-string/`.format` into SQL. This is the tool-call guardrail; string interpolation here is an injection surface.
-- **Prompt caching depends on byte-identical system prompts.** `build_plan_system_prompt` bakes the (static v1) allowlist, so it must return the *same* string every call to hit Groq's cache. If the `companies` seed ever changes, the allowlist (and prompt) regenerate once at the next cold-start — expected. Keep variable content (the user query, the chunks) in the `human` turn only.
+- **Prompt caching depends on byte-identical system prompts.** `build_plan_system_prompt` bakes the (static v1) corpus roster (S16/D3a — it was the bare allowlist as of S13), so it must return the *same* string every call to hit Groq's cache. The roster is rendered ticker-sorted precisely to keep that string stable. If the `companies` seed ever changes, the roster (and prompt) regenerate once at the next cold-start — expected. Keep variable content (the user query, the chunks) in the `human` turn only — as of S16 the roster is the *only* interpolation in the Plan template.
 - **`strict=True` schema constraints.** Constrained decoding requires `additionalProperties: false` + all properties required. Pydantic v2 + LangChain generate this, **but verify the nested `TimeRange` inside `QueryPlan`** serializes correctly (nested models are the usual failure point). Same check for `EvalVerdict`.
 - **Three LLM calls per query now.** Plan + Evaluate + Synthesize all hit Groq (D4 kept LLM sufficiency in v1). Budget accordingly (~30–45 full agent-queries/day on free tier). Evaluate's LLM call is **skipped** whenever coverage gaps exist (precedence) — a natural token saving on the failing path.
 - **`astream` chunk shape.** Guard `chunk.content` (can be empty/`None` on some deltas); yield only truthy content so the SSE stream stays clean.

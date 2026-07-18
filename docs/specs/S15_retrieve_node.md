@@ -23,8 +23,9 @@
    full triple **`(ticker × year × sub_question)`**. The `(ticker, year)` pair is the **WHERE filter**
    (parameterized) and also the **coverage unit** (`compute_coverage_gaps` needs each `(ticker, year)` present);
    the `sub_question` is the **search text** (drives both the jina-v3 query embedding and the lexical
-   `plainto_tsquery`). v8 §7.2's "(ticker × sub-question)" and S13's "(ticker, year)" are two partial views of
-   this same triple — the cross product reconciles them. `needed` cells mirror S13's `compute_coverage_gaps`
+   `plainto_tsquery`). v8 §7.2 *formerly* said "(ticker × sub-question)" and S13's docstring said
+   "(ticker, year)" — two partial views of this same triple, which the cross product reconciles. **v8 §5.2/§7.2
+   have since been corrected to the full triple**, so this tension no longer exists in the docs. `needed` cells mirror S13's `compute_coverage_gaps`
    (full `tickers × years` cartesian; cartesian false-low accepted in v1 → v2 fix).
 4. **D4 — `AgentContext.embedder` piggyback (DERIVED, NECESSARY).** Add `embedder: EmbeddingClient` to
    `AgentContext`, built **once at cold-start** (Choice B pattern, same as `llm`/`reranker`/`pool`/`breaker`).

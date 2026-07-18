@@ -28,7 +28,7 @@ Claude Code reads spec from `docs/specs/Sn_*.md`, runs in **Plan mode**, and **w
 | L5 | `Annotated[list, operator.add]` for `retrieved_chunks` — accumulates across iterations |
 | L6 | Refine node deferred to v3; when added, must ONLY update `query` + `query_plan.time_range` |
 | L7 | `original_query` is an anchor — never mutate |
-| L8 | Groq Circuit Breaker: 5 failures/60s → OPEN 2 min → HALF-OPEN |
+| L8 | `SynthesisCircuitBreaker` on Groq: **3 consecutive** hard failures → OPEN **30s** → HALF-OPEN (amended S14; no rolling window — any success resets the streak to 0) |
 | L9 | `embedding_model_version` column in `chunks` — enables gradual Jina→nomic migration |
 | L10 | **Function URLs** over API Gateway — free forever, native SSE streaming |
 | L11 | **Vercel OIDC auth** on Lambda (`auth=NONE`); PyJWT verifies `VERCEL_OIDC_TOKEN` |
