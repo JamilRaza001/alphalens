@@ -176,6 +176,7 @@ def _state(**overrides: Any) -> AgentState:
         "iteration": 0,
         "retrieved_chunks": [],
         "reranked_chunks": [],
+        "dropped_for_capacity": [],
         "confidence": "high",
         "confidence_reason": "none",
         "coverage_gaps": [],
@@ -316,26 +317,29 @@ async def test_plan_node_keeps_valid_years() -> None:
 # ── Rerank node ───────────────────────────────────────────────────────────────
 
 
-async def test_rerank_node_sorts_and_truncates() -> None:
+async def test_rerank_node_sorts_and_caps() -> None:
+    # S17: a single-pair pool overflowing the cap is capped at max_context_chunks and still
+    # ordered best-first. (Per-pair floor selection has its own suite: test_selection_floor.py.)
     reranker = _FakeReranker()
     ctx = _ctx(reranker=reranker)
-    top_n = get_settings().rerank_top_n
-    n = top_n + 3
-    chunks = [_chunk(f"c{i}", "AAPL", 2023) for i in range(n)]
+    cap = get_settings().max_context_chunks
+    n = cap + 3
+    chunks = [_chunk(f"c{i:02d}", "AAPL", 2023) for i in range(n)]
     out = await rerank_node(_state(retrieved_chunks=chunks), _runtime(ctx))
 
     scored = out["reranked_chunks"]
-    assert len(scored) == top_n  # truncated to settings.rerank_top_n
+    assert len(scored) == cap  # capped at settings.max_context_chunks
     # descending by rerank_score
     assert scored == sorted(scored, key=lambda s: s.rerank_score, reverse=True)
     # highest score first -> the fake gives chunk[0] the top score
-    assert scored[0].chunk.chunk_id == "c0"
+    assert scored[0].chunk.chunk_id == "c00"
+    assert out["dropped_for_capacity"] == []  # one pair, never a coverage drop
     assert reranker.predict_calls  # went through the reranker (off-thread)
 
 
 async def test_rerank_node_empty_input() -> None:
     out = await rerank_node(_state(retrieved_chunks=[]), _runtime(_ctx()))
-    assert out == {"reranked_chunks": []}
+    assert out == {"reranked_chunks": [], "dropped_for_capacity": []}
 
 
 # ── Evaluate node (three branches + precedence) ───────────────────────────────

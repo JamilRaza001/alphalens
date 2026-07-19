@@ -400,6 +400,7 @@ async def test_synthesize_node_routes_open_breaker_to_degraded() -> None:
             "iteration": 0,
             "retrieved_chunks": [],
             "reranked_chunks": reranked,
+            "dropped_for_capacity": [],
             "confidence": "high",
             "confidence_reason": "none",
             "coverage_gaps": [],

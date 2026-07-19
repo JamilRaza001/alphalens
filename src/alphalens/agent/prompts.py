@@ -28,7 +28,11 @@ Decompose the user's question into a structured plan with these fields:
 - time_range.years: the DISCRETE reporting years explicitly named or clearly implied. Each \
 array element must be a SINGLE distinct 4-digit year -- one element per year. Never merge two \
 years into one number, and never add intermediate years that were not asked for.
-- sub_questions: the question broken into atomic, independently-answerable parts.
+- sub_questions: the distinct METRICS or TOPICS the question asks about -- the "what" only. \
+Each element is a single reporting concept (e.g. "research and development spending"). Do NOT \
+bake company names or years into a sub_question: the tickers and time_range.years fields \
+already carry those, and each topic is evaluated against every (ticker, year) combination. \
+One topic per distinct metric -- never one sub_question per company or per year.
 - entities: salient non-ticker entities (people, products, segments, financial metrics).
 
 Examples (time_range.years):
@@ -36,6 +40,14 @@ Examples (time_range.years):
   NEVER [20232024] -- that merges two years into one number and is always wrong.
 - "2022 vs 2024" -> years: [2022, 2024]   (do NOT add the intermediate 2023)
 - "in fiscal 2024" -> years: [2024]
+
+Examples (sub_questions -- topic only, no company/year):
+- "Compare Apple and Microsoft R&D spend 2023 vs 2024"
+  -> tickers: [AAPL, MSFT], years: [2023, 2024], sub_questions: ["research and development spending"]
+  NEVER ["Apple R&D in 2023", "Microsoft R&D in 2024", ...] -- baking the company/year into the \
+topic cross-binds it to the wrong filings and is always wrong.
+- "How did Tesla's revenue and net income change in 2024?"
+  -> sub_questions: ["revenue", "net income"]   (two topics, no ticker or year)
 
 The corpus only covers these companies (TICKER — Company name):
 {roster}
@@ -125,6 +137,11 @@ was simply not retrieved.
 - If any requested years are unavailable (not understood, or outside the corpus's coverage \
 years), state explicitly that they are outside AlphaLens's coverage and were not analyzed. \
 Keep this distinct from evidence that was simply not retrieved.
+- If any (company, year) pairs were omitted DUE TO CONTEXT LIMITS (evidence existed but did \
+not fit the answer's context budget), state plainly which pairs were omitted for capacity \
+reasons -- NOT because the data is missing -- and suggest the user narrow the scope or ask \
+about fewer companies/years at a time. Keep this distinct from out-of-corpus and \
+not-retrieved cases.
 
 Write a clear, concise analyst answer."""
 
@@ -135,15 +152,28 @@ def build_synthesize_user_msg(
     confidence: str,
     unavailable_tickers: list[str],
     unavailable_years: list[int],
+    dropped_for_capacity: list[tuple[str, int]],
 ) -> str:
-    """Assemble the human turn: question, evidence, confidence flag, and the
-    unavailable-ticker / unavailable-year notes (both worded distinctly from coverage gaps)."""
+    """Assemble the human turn: question, evidence, confidence flag, the unavailable-ticker /
+    unavailable-year notes (both worded distinctly from coverage gaps), and -- only when
+    non-empty -- the capacity-dropped (ticker, year) pairs (S17 honesty rail; emitted as
+    nothing on normal queries to avoid disclosure noise)."""
     unavailable = ", ".join(unavailable_tickers) if unavailable_tickers else "(none)"
     bad_years = ", ".join(str(y) for y in unavailable_years) if unavailable_years else "(none)"
+    # Conditional disclosure block: rendered ONLY when capacity forced pairs out (S17). Empty
+    # -> emit nothing, so ordinary answers carry no capacity-note noise.
+    capacity_note = ""
+    if dropped_for_capacity:
+        pairs = ", ".join(f"{ticker} {year}" for ticker, year in dropped_for_capacity)
+        capacity_note = (
+            "Omitted for context capacity (evidence existed but exceeded the context budget "
+            f"-- NOT missing data): {pairs}\n"
+        )
     return (
         f"User question:\n{query}\n\n"
         f"Confidence flag: {confidence}\n"
         f"Unavailable (out-of-corpus) tickers: {unavailable}\n"
-        f"Unavailable (out-of-coverage) years: {bad_years}\n\n"
+        f"Unavailable (out-of-coverage) years: {bad_years}\n"
+        f"{capacity_note}\n"
         f"Retrieved evidence:\n{_render_evidence(reranked)}"
     )

@@ -68,7 +68,14 @@ class QueryPlan(BaseModel):
     )
     time_range: TimeRange = Field(description="Discrete reporting years the query targets.")
     sub_questions: list[str] = Field(
-        description="The query decomposed into atomic, independently-answerable sub-questions."
+        description=(
+            "The distinct METRICS or TOPICS the query asks about -- the 'what' only, one entry "
+            "per reporting concept (e.g. 'research and development spending'). NEVER bake a "
+            "company name or a year into a sub-question: the tickers and time_range.years fields "
+            "carry those, and each topic is cross-joined against every (ticker, year) cell. "
+            "'Compare Apple and Microsoft R&D spend 2023 vs 2024' -> ['research and development "
+            "spending'], NOT one entry per company or per year."
+        )
     )
     entities: list[str] = Field(
         description="Salient non-ticker entities (people, products, segments, metrics) named in the query."
@@ -158,6 +165,12 @@ class AgentState(TypedDict):
     # -- Accumulated: operator.add reducer (L5, forward-compatible with v3) --
     retrieved_chunks: Annotated[list[RetrievedChunk], operator.add]
     reranked_chunks: list[ScoredChunk]  # NO reducer -- replaced each pass
+    # (ticker, year) pairs that HAD candidates but were dropped by the Rerank selection step
+    # because query breadth (n_pairs x floor) exceeded max_context_chunks (S17). Semantically
+    # DISTINCT from coverage_gaps (no evidence in the corpus) and unavailable_tickers/years
+    # (outside the universe): here the evidence existed but context capacity did not. Written
+    # once by rerank_node, read once by synthesize_node's honesty rail. No reducer -- replaced.
+    dropped_for_capacity: list[tuple[str, int]]
 
     # -- Evaluate output --
     # Derived then stored: the Evaluate node (S13) runs a deterministic coverage

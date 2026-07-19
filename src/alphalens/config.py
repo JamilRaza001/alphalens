@@ -12,7 +12,13 @@ import re
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr, computed_field, field_validator, model_validator
+from pydantic import (
+    SecretStr,
+    ValidationInfo,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -76,9 +82,14 @@ class Settings(BaseSettings):
 
     # ── Reranker (L3, L14) ────────────────────────────────────────────────────
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    rerank_top_n: int = (
-        8  # top-N ScoredChunks kept by the Rerank node; eval-tunable (env: RERANK_TOP_N) — S15 D2
-    )
+
+    # ── Selection — cell-aware per-pair floor (S17) ───────────────────────────
+    # Replaces the old global top-N slice (rerank_top_n). `floor_per_pair` guarantees each
+    # non-empty (ticker, year) pair a minimum number of chunks so one ticker can no longer
+    # occupy every slot; `max_context_chunks` is the hard budget of chunks handed to Synthesize.
+    # Env-overridable: FLOOR_PER_PAIR / MAX_CONTEXT_CHUNKS.
+    floor_per_pair: int = 2
+    max_context_chunks: int = 8
 
     # ── Retrieval — per-cell hybrid fan-out (S15 D1) ──────────────────────────
     # All env-overridable: RETRIEVAL_K_VECTOR, RETRIEVAL_K_LEXICAL, RETRIEVAL_RRF_C, RETRIEVAL_N_PER_CELL.
@@ -159,6 +170,24 @@ class Settings(BaseSettings):
                 "pgvector schema is VECTOR(768) — see locked decision L17"
             )
         return v
+
+    @field_validator("floor_per_pair", "max_context_chunks")
+    @classmethod
+    def _validate_selection_positive(cls, v: int, info: ValidationInfo) -> int:
+        """Both selection knobs must be >= 1 (S17): a floor/cap below 1 selects nothing."""
+        if v < 1:
+            raise ValueError(f"{info.field_name} must be >= 1 (got {v})")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_floor_within_cap(self) -> Settings:
+        """S17: the per-pair floor cannot exceed the total context budget."""
+        if self.floor_per_pair > self.max_context_chunks:
+            raise ValueError(
+                f"floor_per_pair ({self.floor_per_pair}) must be <= max_context_chunks "
+                f"({self.max_context_chunks}); a floor above the cap is unsatisfiable"
+            )
+        return self
 
     @model_validator(mode="after")
     def _default_agent_db_url(self) -> Settings:

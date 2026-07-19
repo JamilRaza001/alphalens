@@ -398,24 +398,117 @@ async def retrieve_node(state: AgentState, runtime: Runtime[AgentContext]) -> di
         )
     )
 
-    return {"retrieved_chunks": merge_dedup(cell_results)}
+    merged = merge_dedup(cell_results)
+    return {"retrieved_chunks": merged}
+
+
+# ── Pure helper: cell-aware keep-selection (S17, testable, no I/O) ───────────
+def select_with_floor(
+    scored: list[ScoredChunk],
+    *,
+    floor_per_pair: int,
+    max_context_chunks: int,
+) -> tuple[list[ScoredChunk], list[tuple[str, int]]]:
+    """Cell-aware keep-selection replacing the global sort-and-slice (S17, Lever #1).
+
+    Groups the reranked survivors by their surviving ``(ticker, period_year)`` pair (cell
+    provenance is already discarded by ``merge_dedup`` -- G11: only these two flat fields are
+    used, no re-thread), guarantees each non-empty pair a floor of chunks from its OWN
+    top-scored candidates, fills the remaining budget by global rerank score (merit preserved),
+    and caps the total at ``max_context_chunks``. Degrades honestly when breadth overflows the
+    cap: reduce depth before dropping coverage, and report any pair dropped for capacity.
+
+    Returns ``(selected, dropped_for_capacity)``:
+      selected              -> chunks to pass downstream, ``len <= max_context_chunks``
+      dropped_for_capacity  -> (ticker, year) pairs that HAD candidates but got 0 slots
+                               (hard-overflow only; ``[]`` otherwise)
+
+    Pure and deterministic: ties break stably by rerank score desc, then ``chunk_id``.
+    """
+    cap = max_context_chunks
+    if not scored:
+        return [], []
+
+    # 1. Group by (ticker, period_year) -- the selection grain (never the retrieval cell).
+    groups: dict[tuple[str, int], list[ScoredChunk]] = {}
+    for sc in scored:
+        groups.setdefault((sc.chunk.ticker, sc.chunk.period_year), []).append(sc)
+
+    # 2. Sort each pair by score desc, stable tie-break on chunk_id.
+    for pair_chunks in groups.values():
+        pair_chunks.sort(key=lambda sc: (-sc.rerank_score, sc.chunk.chunk_id))
+
+    n_pairs = len(groups)
+
+    # 4. Pick effective_floor + the set of kept pairs.
+    dropped: list[tuple[str, int]] = []
+    if n_pairs * floor_per_pair <= cap:  # (a) normal: every pair gets the full floor
+        effective_floor = floor_per_pair
+        kept_pairs = set(groups)
+    elif n_pairs <= cap:  # (b) GRADUATED: reduce depth, keep all coverage
+        effective_floor = max(1, cap // n_pairs)
+        kept_pairs = set(groups)
+    else:  # (c) HARD OVERFLOW: coverage must be cut -- keep the strongest `cap` pairs
+        effective_floor = 1
+        ranked = sorted(
+            groups.items(),
+            key=lambda kv: (-kv[1][0].rerank_score, kv[1][0].chunk.chunk_id),
+        )
+        kept_pairs = {key for key, _ in ranked[:cap]}
+        dropped = sorted(key for key, _ in ranked[cap:])
+
+    # 5. Reserve each kept pair's floor (min(floor, len) via slice = empty-cell reclaim).
+    reserved: list[ScoredChunk] = []
+    reserved_ids: set[str] = set()
+    for key, pair_chunks in groups.items():
+        if key not in kept_pairs:
+            continue
+        for sc in pair_chunks[:effective_floor]:
+            reserved.append(sc)
+            reserved_ids.add(sc.chunk.chunk_id)
+
+    # 6-7. Fill the freed/remaining budget by global score desc from kept, non-reserved chunks.
+    remaining = cap - len(reserved)
+    fill: list[ScoredChunk] = []
+    if remaining > 0:
+        fill_pool = [
+            sc
+            for sc in scored
+            if sc.chunk.chunk_id not in reserved_ids
+            and (sc.chunk.ticker, sc.chunk.period_year) in kept_pairs
+        ]
+        fill_pool.sort(key=lambda sc: (-sc.rerank_score, sc.chunk.chunk_id))
+        fill = fill_pool[:remaining]
+
+    # 8. Final context order: best evidence first (stable).
+    selected = reserved + fill
+    selected.sort(key=lambda sc: (-sc.rerank_score, sc.chunk.chunk_id))
+    return selected, dropped
 
 
 # ── Node 3: Rerank -- cross-encoder, in-process (L3) ─────────────────────────
 async def rerank_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[str, Any]:
     chunks = state["retrieved_chunks"]
     if not chunks:
-        return {"reranked_chunks": []}
+        return {"reranked_chunks": [], "dropped_for_capacity": []}
     pairs = [(state["query"], c.text) for c in chunks]
     # CrossEncoder.predict is sync + CPU-bound -> offload so we don't block the event loop.
     # Wrapped in a lambda so mypy resolves predict's overload at the call site; pairs is
     # cast to Any because predict's typed input union rejects list[tuple[str, str]] (invariance).
+    # SCORING is against state["query"] (the FULL query) -- untouched, Lever #2 owns this (S17/AC9).
     scores = await asyncio.to_thread(lambda: runtime.context.reranker.predict(cast(Any, pairs)))
     scored = [
         ScoredChunk(chunk=c, rerank_score=float(s)) for c, s in zip(chunks, scores, strict=True)
     ]
     scored.sort(key=lambda sc: sc.rerank_score, reverse=True)
-    return {"reranked_chunks": scored[: get_settings().rerank_top_n]}
+    # S17: cell-aware per-pair floor replaces the global `scored[:rerank_top_n]` slice.
+    cfg = get_settings()
+    selected, dropped = select_with_floor(
+        scored,
+        floor_per_pair=cfg.floor_per_pair,
+        max_context_chunks=cfg.max_context_chunks,
+    )
+    return {"reranked_chunks": selected, "dropped_for_capacity": dropped}
 
 
 # ── Node 4: Evaluate -- two-signal, coverage precedence (D4) ──────────────────
@@ -469,6 +562,7 @@ async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> 
                 confidence=state["confidence"],
                 unavailable_tickers=state["unavailable_tickers"],
                 unavailable_years=state["unavailable_years"],
+                dropped_for_capacity=state["dropped_for_capacity"],
             ),
         ),
     ]

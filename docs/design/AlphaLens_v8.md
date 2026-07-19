@@ -121,7 +121,7 @@ These decisions are **locked**. Any change requires explicit version bump (v8 �
 | L5 | `Annotated[list, operator.add]` for `retrieved_chunks` | LangGraph state mechanic. Accumulates chunks across iterations rather than overwriting (forward-compatible with v3 retry loop) |
 | L6 | **RESERVED** — Refine node deferred to v3 | Node 6 (Refine) scope constraint preserved for v3: must ONLY update `query` + `query_plan.time_range`. NEVER mutates `tickers` or `intent` |
 | L7 | `original_query` is an **anchor** | Never mutates. Used for logging, citation framing, retry comparison |
-| L8 | Circuit Breaker on Groq: **5 failures/60s → OPEN 2 min → HALF-OPEN** | Protects against Groq downtime cascades. Half-open allows 1 trial before full recovery |
+| L8 | `SynthesisCircuitBreaker` on Groq: **3 consecutive hard failures → OPEN 30s → HALF-OPEN** *(amended at S14 — was "5 failures/60s → OPEN 2 min")* | Protects against Groq downtime cascades. Half-open allows 1 trial before full recovery. **Amended:** consecutive counting (any success resets the streak to 0) replaced the rolling window — no timestamp bookkeeping, and a 5-in-60s *window* could trip on transient noise interleaved with successes. 3/30s recovers faster on a brief blip while still shielding a real outage; both are env-tunable (`BREAKER_FAILURE_THRESHOLD` / `BREAKER_RESET_TIMEOUT_SECONDS`). See §7.4 |
 | L9 | `embedding_model_version` column in `chunks` table | Enables gradual re-embed migration (Jina → nomic) without big-bang ETL |
 | L10 | **Function URLs** over API Gateway | API Gateway costs $1/M after free tier; Function URLs free forever; native SSE streaming |
 | L11 | **Vercel OIDC auth** on Lambda (NOT SigV4 / NOT `AWS_IAM`) | **SUPERSEDES v7 L11.** Vercel OIDC eliminates SigV4 complexity from frontend. Lambda URL `auth=NONE` (public URL). FastAPI middleware verifies `VERCEL_OIDC_TOKEN` via PyJWT + PyJWKClient |
@@ -222,16 +222,19 @@ These decisions are **locked**. Any change requires explicit version bump (v8 �
        ▼
 ┌──────────────┐
 │ 2. Retrieve  │ Per-cell fan-out (query decomposition): one
-│  + Filter    │ hybrid query per (ticker × sub-question) cell —
-│              │ HNSW vector + tsvector lexical, metadata
-│              │ filters in WHERE clause, RRF fusion per cell,
-│              │ then merge. Per-cell k/n config-driven,
-│              │ pinned at S15.
+│  + Filter    │ hybrid query per (ticker × year × sub-question)
+│              │ cell — HNSW vector + lexical ts_rank_cd (L1),
+│              │ metadata filters in WHERE clause, RRF fusion
+│              │ per cell (SQL FULL OUTER JOIN, c=60), then
+│              │ merge + chunk_id dedup. Per-cell k/n
+│              │ config-driven, pinned at S15.
 └──────┬───────┘
        ▼
 ┌──────────────┐
-│ 3. Rerank    │ Cross-encoder (in-process) → top-N
-│              │ ms-marco-MiniLM-L-6-v2
+│ 3. Rerank    │ Cross-encoder (in-process) → GLOBAL top-N
+│              │ ms-marco-MiniLM-L-6-v2. Scores the whole
+│              │ merged pool against `query`; single global
+│              │ sort + slice — no per-cell floor in v1.
 └──────┬───────┘
        ▼
 ┌──────────────┐
@@ -366,45 +369,67 @@ Free tier: 500 MB. Headroom: ~33%.
 
 ### 7.1 State Schema
 
+> Reconciled to live `src/alphalens/agent/state.py` (S12, extended by S16). That module is ground
+> truth; the S12 spec's decisions D1–D4 deliberately superseded this section's earlier draft.
+
 ```python
-from typing import Annotated, AsyncGenerator
-from operator import add
+import operator
+from collections.abc import AsyncGenerator
+from typing import Annotated, Literal
 from typing_extensions import TypedDict
 
 
 class AgentState(TypedDict):
-    # Anchors (set once, NEVER mutated)
+    # Anchors (set once at intake, NEVER mutated — L7)
     original_query: str
-    user_id: str | None
     request_id: str
+    user_id: str | None
 
-    # Plan (set in Node 1 — Plan)
-    query_plan: QueryPlan       # tickers, intent, time_range, sub_questions
-    tickers: list[str]          # Anchored after Node 1
-    intent: str                 # 'comparative' | 'temporal' | 'factual' | 'qualitative'
-    entities: list[str]         # Extracted for v2 KG traversal (used in v1 for metadata filtering)
+    # Plan (set in Node 1). D2: query_plan is the SOLE home of tickers/intent/entities —
+    # there are NO top-level copies of them.
+    query_plan: QueryPlan            # tickers, intent, time_range, sub_questions, entities
+    unavailable_tickers: list[str]   # dropped by the Plan input-rail (not in corpus at all)
+    unavailable_years: list[int]     # dropped by the Plan year-rail (implausible corpus year)
 
-    # Mutable per-iteration
-    query: str                  # Reformulated in v3 Refine node (pass-through in v1)
-    iteration: int
+    # Mutable per pass
+    query: str                       # == original_query in v1; v3 Refine rewrites it (L6)
+    iteration: int                   # always 0 in v1
 
-    # Accumulated state (operator.add — forward-compatible with v3 retry loop)
-    retrieved_chunks: Annotated[list[Chunk], add]
-    reranked_chunks: list[ScoredChunk]  # Reset each pass
+    # Accumulated (operator.add — forward-compatible with the v3 retry loop, L5)
+    retrieved_chunks: Annotated[list[RetrievedChunk], operator.add]
+    reranked_chunks: list[ScoredChunk]   # NO reducer — replaced each pass
+
+    # Evaluate output
+    confidence: Literal["low", "high"]                    # D1: a label, NOT a float
+    confidence_reason: Literal["coverage", "llm", "none"] # D3: which signal drove the verdict
+    coverage_gaps: list[tuple[str, int]]                  # missing (ticker, year); [] = full
 
     # Output
-    answer_stream: AsyncGenerator[str, None] | None
     citations: list[Citation]
-    confidence: float           # Set by Evaluate node; surfaced in response if low
+    answer_stream: AsyncGenerator[str, None] | None
 ```
+
+**Reconciliation notes (why this differs from the v8 draft above it):**
+
+- **D1** — `confidence` is a `Literal["low", "high"]` label, not a `float`. Nothing consumed a
+  continuous score, and a float invited fake precision.
+- **D2** — `tickers` / `intent` / `entities` are **not** top-level keys; they live only inside
+  `query_plan`. Top-level copies were a second source of truth that could drift.
+- **D3** — `confidence_reason` is new: it records *which* signal drove the verdict, so a "low" from
+  the deterministic coverage-check is distinguishable from a "low" from the LLM's own judgment.
+- **D4** — `retrieved_chunks` holds `RetrievedChunk` (agent-side, DB-derived, join-enriched with
+  `chunk_id`/`ticker`/`period_year`), **not** the ETL `Chunk` (ingestion-side value object).
+- **S16** — `unavailable_tickers` / `unavailable_years` carry the two Plan rails' drop-and-note
+  output. Both are **pre-retrieval** drops and are deliberately distinct from `coverage_gaps`,
+  which are in-corpus cells that retrieval *missed*.
 
 ### 7.2 Node Responsibilities
 
 | Node | Responsibility | LLM call? |
 |---|---|---|
 | **1. Plan** | Decompose query → tickers, intent, time_range, sub_questions, entities | ✅ Yes |
-| **2. Retrieve+Filter** | Per-cell fan-out (query decomposition): one hybrid HNSW + tsvector query per (ticker × sub-question) cell; metadata filters in WHERE clause; RRF fusion per cell, then merge. Per-cell k/n config-driven, pinned at S15 | ❌ No |
-| **3. Rerank** | Cross-encoder in-process (ms-marco-MiniLM-L-6-v2) → top-N scored chunks | ❌ No |
+| **2. Retrieve+Filter** | Per-cell fan-out (query decomposition): one hybrid HNSW-vector + lexical `ts_rank_cd` (L1) query per (ticker × year × sub-question) cell, run concurrently (`asyncio.gather`, bounded by the pool's `max_size=5`); metadata filters in the WHERE clause; RRF fusion per cell in SQL (`FULL OUTER JOIN`, c=60), then merge with `chunk_id` dedup. Per-cell k/n config-driven, pinned at S15. **Invariant:** query embeddings must be jina-v3 (corpus is homogeneous) — a nomic fallback is a loud `RuntimeError`, never a silent mismatched-vector-space search | ❌ No |
+| **3. Rerank+Select** | Cross-encoder in-process (ms-marco-MiniLM-L-6-v2) scores the entire merged pool against `query` in one batch (off-loop via `asyncio.to_thread`), then **cell-aware per-pair selection** (S17, `select_with_floor`): group survivors by `(ticker, period_year)`, guarantee each non-empty pair a floor (`floor_per_pair=2`) of its own top chunks, fill remaining budget by global score, cap total at `max_context_chunks=20`. Degrades honestly on overflow — graduated depth-reduction before dropping coverage; pairs dropped for capacity are reported via `dropped_for_capacity` for Synthesize to disclose. Replaces the v1 global sort-and-slice, so one ticker can no longer occupy every slot. **Scoring is still against the full `query`** (per-sub-question scoping is the deferred Lever #2) | ❌ No |
 | **4. Evaluate** | Two-signal: deterministic coverage-check + LLM sufficiency assessment (coverage takes precedence) → annotate `confidence` (low/high) | ✅ Yes |
 | **5. Synthesize** | Groq streams answer with citations via SSE; surfaces low-confidence flag if set | ✅ Yes |
 
@@ -416,32 +441,74 @@ class AgentState(TypedDict):
 
 ### 7.4 Circuit Breaker (Groq)
 
+> Reconciled to live `src/alphalens/agent/circuit_breaker.py` (S14). **L8 amended at S14:** consecutive
+> counting replaced the rolling window, threshold 5→**3**, open duration 2 min→**30s**. See §3 L8.
+
 ```python
-class GroqCircuitBreaker:
-    failure_threshold = 5         # failures
-    failure_window = 60           # seconds
-    open_duration = 120           # seconds (2 minutes)
-    half_open_trial_requests = 1
-    states = ['CLOSED', 'OPEN', 'HALF_OPEN']
+class SynthesisCircuitBreaker:              # NOT "GroqCircuitBreaker" — it is domain-agnostic
+    """Guards the Groq synthesis stream. In-memory, per-container: state is a dep on
+    AgentContext, built once at cold-start. NO shared datastore across Lambda containers."""
+    failure_threshold = 3        # CONSECUTIVE hard failures; env BREAKER_FAILURE_THRESHOLD
+    reset_timeout_seconds = 30.0 # OPEN cool-off, monotonic clock; env BREAKER_RESET_TIMEOUT_SECONDS
+    # states: BreakerState.CLOSED | OPEN | HALF_OPEN (StrEnum)
 ```
 
 **Transitions:**
-- CLOSED → OPEN: 5 failures within 60s
-- OPEN → HALF_OPEN: After 2 minutes
-- HALF_OPEN → CLOSED: 1 successful request
-- HALF_OPEN → OPEN: 1 failed request
+- CLOSED → OPEN: **3 consecutive** hard failures (any success resets the streak to 0 — no time window)
+- OPEN → HALF_OPEN: after 30s on a **monotonic** clock
+- HALF_OPEN → CLOSED: 1 successful probe
+- HALF_OPEN → OPEN: 1 failed probe (the timer restarts **from zero**)
 
-**When OPEN:** agent returns degraded response (top reranked chunks without LLM synthesis), with explicit "LLM unavailable" notice in citations.
+**What counts as a failure (D1 — `is_hard_failure`):** 5xx / timeout / connection errors count. **429
+rate-limits and non-429 4xx are excluded** and re-raised — they are caller errors or backpressure, not
+provider outages, and counting them would trip the breaker on our own bad request. `except Exception`
+only, so `CancelledError` propagates.
 
-### 7.5 Ticker Resolution (Input Rail)
+**When OPEN:** the agent serves a **degraded response** — the top reranked SEC chunks streamed verbatim
+with source tags, no LLM synthesis (`degraded_stream` in `nodes.py`, kept there so the breaker stays
+`AgentState`-agnostic). This is a real, honest answer built from retrieved evidence, not an error page.
 
-Tickers are resolved through a three-step input rail, not free-form LLM extraction:
+**Failure timing matters:** a hard failure **before the first token** falls back to the degraded stream;
+one **mid-stream** propagates, because partial output has already reached the user and silently swapping
+in different content would be dishonest.
 
-1. **DB-allowlist** — the set of valid tickers is loaded from the `companies` table (10 rows in v1); this is the authoritative universe.
-2. **Prompt-inject** — the allowlist is injected into the Plan-node prompt so the LLM can only map company mentions onto known tickers.
-3. **Validate** — the LLM's proposed tickers are validated against the allowlist after generation; anything off-allowlist is dropped before retrieval.
+### 7.5 Plan Input Rails (Tickers + Years)
 
-This keeps the Plan node from hallucinating tickers for companies outside the corpus and bounds the retrieval space to filings that actually exist.
+Plan output is constrained by rails, not trusted as free-form LLM extraction. Every rail follows the
+same **soft-guide + hard-gate** split: the prompt *guides*, deterministic code *enforces*. The prompt
+is never load-bearing — see the year rail below for why that distinction is not academic.
+
+**Ticker rail** (S16/D3a, D3b):
+
+1. **DB-allowlist** — the valid ticker universe is loaded from the `companies` table (10 rows in v1)
+   once at cold-start; this is the authoritative set.
+2. **Prompt-inject (soft guide)** — a **roster** (ticker → company name), not a bare ticker list, is
+   baked into the Plan system prompt so word→ticker resolution is *grounded* rather than recalled from
+   the model's parametric memory. Rendered ticker-sorted to keep the prompt byte-stable for Groq's cache.
+3. **Validate (hard gate)** — `validate_tickers` checks the LLM's proposed tickers against the
+   allowlist *after* generation. Off-corpus tickers are **dropped and noted** into
+   `unavailable_tickers`, which Synthesize surfaces explicitly.
+
+**Year rail** (S16, added after the first live run):
+
+1. **Bounds** — `corpus_min_year` / `corpus_max_year` (2021–2026, env-tunable) define plausible
+   reporting years.
+2. **Prompt-inject (soft guide)** — the Plan template requires one discrete 4-digit year per array
+   element, with an explicit negative example.
+3. **Repair, then validate (hard gate)** — `split_concatenated_years` deterministically repairs years
+   the model merged into one integer (`20232024` → `[2023, 2024]`), then `validate_years` drops
+   anything out of bounds into `unavailable_years`.
+
+> **Why the repair step exists.** The first live run returned a false "no coverage" answer because Plan
+> emitted `time_range.years = [20232024]` for "2023 vs 2024" — a year matching zero filings. It did so at
+> **temperature 0 under strict constrained decoding, with a negative example naming that exact wrong
+> value already in the prompt.** Retrieval was healthy; the system answered correctly on a garbage plan.
+> The lesson generalized across both rails: prompt instructions are a free nudge, and the deterministic
+> gate is the only thing that actually holds.
+
+Together these keep Plan from hallucinating out-of-corpus tickers or unmatched years, bound the
+retrieval space to filings that exist, and make every drop *visible* in the answer rather than silently
+degrading into an empty result.
 
 ---
 
@@ -600,54 +667,10 @@ If after 6 months the user wants to push monthly cost from ~$0.25 to literal $0:
 
 ## 10. Project Status Dashboard
 
-### 10.1 Current Status: **Phase 1 Setup, ~10% complete**
-
-### 10.2 Completed ✅
-
-| Item | Detail | Date |
-|---|---|---|
-| AWS account created | Personal account, primary region `ap-southeast-1` | (recently) |
-| AWS $100 free-tier credits | Active, 6-month expiry from account creation | (recently) |
-| AWS root MFA | Enabled (per setup guide Part 2.1.a) | (recently) |
-| Design Review Session 1 | Changes #1 + #2 locked | Session 1 |
-| Design Review Session 2 | Changes #3–#7 locked, v8 authored | May 1, 2026 |
-
-### 10.3 In Progress 🟡
-
-*(Nothing actively in progress as of v8 publication.)*
-
-### 10.4 Pending — Phase 1 Setup ⬜
-
-Reference: `Phase1_Setup_Guide.md`. Remaining tasks:
-
-| Part | Item | Status |
-|---|---|---|
-| Part 1 | Local environment: uv, Python 3.12, Docker, Git, AWS CLI v2, VS Code | ⬜ |
-| Part 2.2 | Neon project + pgvector | ⬜ |
-| Part 2.3 | Cloudflare R2 bucket + API token | ⬜ |
-| Part 2.4 | Groq API key | ⬜ |
-| Part 2.5 | Jina API key (note actual free tier limit on signup) | ⬜ |
-| Part 2.6 | Vercel account | ⬜ |
-| Part 2.7 | Sentry org + Next.js project | ⬜ |
-| Part 2.8 | Opik workspace | ⬜ |
-| Part 2.9 | GitHub repo `alphalens` cloned | ⬜ |
-| Part 3 | All 5 billing guardrail layers | ⬜ |
-| Part 4 | IAM admin + deployer + frontend-invoke users | ⬜ |
-| Part 5 | Repo bootstrap (pyproject, ruff, pre-commit, dirs) | ⬜ |
-| Part 6 | Service init (Alembic stub, R2 lifecycle, ECR repo + lifecycle) | ⬜ |
-| Part 7 | Smoke test passes 5/5 | ⬜ |
-
-> Note: Only ONE ECR repo needed now (reranker merged into agent container).
-
-### 10.5 Pending — Phase 2 Implementation ⬜
-
-| Sub-phase | Specs | Status |
-|---|---|---|
-| 1.A — Core Pipeline | 01–08 (settings, schema, EDGAR, sections, chunker, embeddings+fallback, upsert, state machine) | ⬜ Not authored, not implemented |
-| 1.B — Agent | 09–12 (state, nodes, circuit breaker, retrieval) | ⬜ Not authored, not implemented |
-| 1.C — Deployment | 13–17 (Dockerfile, Lambda deploy, R2 setup, observability, frontend) | ⬜ Not authored, not implemented |
-
-> Note: Spec numbering shifted — XBRL parser removed from Phase 1 (was spec 09, now deferred to v2). See §13 for updated spec list.
+> **Moved.** Live project status is tracked in **[`docs/PROJECT_STATUS.md`](../PROJECT_STATUS.md)** —
+> the single source of truth for spec status, commit hashes, and the ETL backfill. The static
+> dashboard that lived here (frozen at "Phase 1 Setup, ~10% complete") was duplicating it and had
+> drifted far out of date; maintaining two status records guarantees one of them lies.
 
 ---
 
