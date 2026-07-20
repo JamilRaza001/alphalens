@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+_OVERFLOW_URL = "https://data.sec.gov/submissions/{name}"
 _ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash}/{doc}"
 
 # Transient network errors worth retrying (no HTTP status to inspect). httpx.TimeoutException
@@ -188,36 +189,62 @@ class EdgarClient:
         if self._own_http:
             await self._http.aclose()
 
-    async def list_filings(
-        self,
-        cik: str,
-        form_types: Iterable[str] = ("10-K", "10-Q"),
-        date_from: date = date(2022, 1, 1),
-        date_to: date = date(2026, 12, 31),
-    ) -> list[FilingMetadata]:
-        """Return filings for *cik* filtered by form type and date range.
+    @staticmethod
+    def _page_bounds(page: dict[str, Any]) -> tuple[date, date] | None:
+        """Parsed ``(filingFrom, filingTo)`` of an overflow page, or ``None`` if unusable.
 
-        Calls ``data.sec.gov/submissions/CIK{cik}.json`` once — no pagination
-        for the recent-filings window (covers 2022–2026 for all seeded CIKs).
+        ``None`` means the page cannot be judged against the window — missing or
+        unparseable bounds. Callers must treat that as "fetch anyway", never as a skip.
         """
-        url = _SUBMISSIONS_URL.format(cik=cik)
-        data: dict[str, Any] = (await self._get_sec(url)).json()
-        recent: dict[str, list[Any]] = data["filings"]["recent"]
+        raw_from = page.get("filingFrom")
+        raw_to = page.get("filingTo")
+        if not raw_from or not raw_to:
+            return None
+        try:
+            return date.fromisoformat(raw_from), date.fromisoformat(raw_to)
+        except ValueError:
+            return None
 
-        # The "recent" window holds the latest ~1000 filings. Older filings spill into
-        # paginated "files" entries we do not read. Harmless for the current 10 mega-cap
-        # CIKs over 2022-2026, but make the cliff loud if the corpus/window ever grows.
-        overflow: list[Any] = data["filings"].get("files") or []
-        if overflow:
-            _log.warning("EDGAR overflow for CIK %s: %d extra page(s) NOT read", cik, len(overflow))
+    @staticmethod
+    def _page_overlaps(page: dict[str, Any], date_from: date, date_to: date) -> bool:
+        """True if an overflow page's ``[filingFrom, filingTo]`` intersects the window.
 
-        forms: list[str] = recent.get("form", [])
-        filing_dates: list[str] = recent.get("filingDate", [])
-        report_dates: list[str] = recent.get("reportDate", [])
-        accessions: list[str] = recent.get("accessionNumber", [])
-        primary_docs: list[str] = recent.get("primaryDocument", [])
+        Overlap rule: ``page.filingTo >= date_from AND page.filingFrom <= date_to``
+        (inclusive on both ends — a page that merely touches a boundary still overlaps).
 
-        form_set = set(form_types)
+        Pages carry their own date bounds, so non-overlapping pages are skipped without
+        a GET. If the bounds are unusable (:meth:`_page_bounds` returns ``None``) we return
+        ``True`` and fetch: the whole point of this path is to stop silently dropping
+        filings, so an unknown bound must never cause a skip.
+        """
+        bounds = EdgarClient._page_bounds(page)
+        if bounds is None:
+            return True
+        page_from, page_to = bounds
+        return page_to >= date_from and page_from <= date_to
+
+    @staticmethod
+    def _parse_filing_block(
+        block: dict[str, list[Any]],
+        cik: str,
+        *,
+        form_set: set[str],
+        date_from: date,
+        date_to: date,
+    ) -> list[FilingMetadata]:
+        """Parse one flat block of parallel arrays into filtered :class:`FilingMetadata`.
+
+        Shared by ``filings.recent`` and every fetched overflow page — both use the exact
+        same flat shape (``form`` / ``filingDate`` / ``reportDate`` / ``accessionNumber`` /
+        ``primaryDocument``), live-confirmed. Single home for the form + date filters so
+        the two sources can never drift apart.
+        """
+        forms: list[str] = block.get("form", [])
+        filing_dates: list[str] = block.get("filingDate", [])
+        report_dates: list[str] = block.get("reportDate", [])
+        accessions: list[str] = block.get("accessionNumber", [])
+        primary_docs: list[str] = block.get("primaryDocument", [])
+
         cik_int = str(int(cik))  # strip leading zeros for archive URL
         results: list[FilingMetadata] = []
 
@@ -246,6 +273,73 @@ class EdgarClient:
                 )
             )
         return results
+
+    async def list_filings(
+        self,
+        cik: str,
+        form_types: Iterable[str] = ("10-K", "10-Q"),
+        date_from: date = date(2022, 1, 1),
+        date_to: date = date(2026, 12, 31),
+    ) -> list[FilingMetadata]:
+        """Return filings for *cik* filtered by form type and date range.
+
+        Reads ``data.sec.gov/submissions/CIK{cik}.json``, then follows the overflow pages
+        in ``filings.files[]`` whose date bounds intersect ``[date_from, date_to]``.
+
+        The ``recent`` window holds only the latest ~1000 filings across *all* form types,
+        so for high-volume filers (JPM: 68 overflow pages) it reaches back mere months and
+        the 10-K/10-Q history lives entirely in overflow. Both sources go through the same
+        parser and filters; the union is deduplicated on ``accession_number``.
+        """
+        url = _SUBMISSIONS_URL.format(cik=cik)
+        data: dict[str, Any] = (await self._get_sec(url)).json()
+        form_set = set(form_types)
+
+        recent: dict[str, list[Any]] = data["filings"]["recent"]
+        results: list[FilingMetadata] = self._parse_filing_block(
+            recent, cik, form_set=form_set, date_from=date_from, date_to=date_to
+        )
+
+        # Pages are newest-first, but _page_overlaps is order-independent: scan every page,
+        # never break early on the first miss.
+        overflow: list[dict[str, Any]] = data["filings"].get("files") or []
+        pages = [p for p in overflow if self._page_overlaps(p, date_from, date_to)]
+        if overflow:
+            # Expected path since the S-fix — reading overflow is normal, not an anomaly.
+            _log.info(
+                "EDGAR overflow for CIK %s: %d page(s) found, %d overlap the window and "
+                "will be read",
+                cik,
+                len(overflow),
+                len(pages),
+            )
+
+        # Sequential — the 10 req/s budget is per-IP and global, so no parallel page fetches.
+        for page in pages:
+            if self._page_bounds(page) is None:
+                # The real anomaly: SEC gave us a page we cannot judge, so we fetch blind
+                # rather than risk dropping filings. Worth a human look if it persists.
+                _log.warning(
+                    "EDGAR overflow page %s for CIK %s has unusable date bounds "
+                    "(filingFrom/filingTo missing or unparseable) — fetching it anyway",
+                    page.get("name"),
+                    cik,
+                )
+            page_data: dict[str, list[Any]] = (
+                await self._get_sec(_OVERFLOW_URL.format(name=page["name"]))
+            ).json()
+            results.extend(
+                self._parse_filing_block(
+                    page_data, cik, form_set=form_set, date_from=date_from, date_to=date_to
+                )
+            )
+
+        # Defensive: a filing present in both recent and an overflow page must not
+        # double-enqueue. Order-preserving, recent wins.
+        deduped: dict[str, FilingMetadata] = {}
+        for meta in results:
+            deduped.setdefault(meta.accession_number, meta)
+        return list(deduped.values())
 
     async def fetch_primary_doc(self, meta: FilingMetadata) -> bytes:
         """Return primary document bytes, using R2 as a write-through cache.

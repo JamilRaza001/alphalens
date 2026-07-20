@@ -156,41 +156,69 @@ def test_is_retryable_ignores_unrelated_exception() -> None:
     assert not _is_retryable(ValueError("not network"))
 
 
-# ── C3 (#7): list_filings warns (but does not fail) on EDGAR overflow ──
+# ── C3 (#7) + S-fix logging: overflow reads are INFO, unusable bounds are WARNING ──
 
 
-@pytest.mark.asyncio
-async def test_list_filings_warns_on_overflow(
-    mock_settings: MagicMock, caplog: pytest.LogCaptureFixture
-) -> None:
-    """C3: a non-empty filings.files overflow logs a warning naming the CIK + page count."""
-    empty_recent: dict[str, list[str]] = {
+def _overflow_client(mock_settings: MagicMock, page: dict[str, Any]) -> EdgarClient:
+    """An EdgarClient whose submissions payload carries exactly one overflow *page*."""
+    empty_block: dict[str, list[str]] = {
         "form": [],
         "filingDate": [],
         "reportDate": [],
         "accessionNumber": [],
         "primaryDocument": [],
     }
-    payload: dict[str, Any] = {
-        "filings": {
-            "recent": empty_recent,
-            "files": [{"name": "CIK0000320193-submissions-001.json"}],
-        }
-    }
+    payload: dict[str, Any] = {"filings": {"recent": empty_block, "files": [page]}}
     resp: MagicMock = MagicMock()
+    # Every GET (submissions + the overflow page itself) returns this payload; the page
+    # body parses to zero rows, which is all these logging assertions need.
     resp.json = MagicMock(return_value=payload)
     resp.raise_for_status = MagicMock()
     http_mock: MagicMock = MagicMock(spec=httpx.AsyncClient)
     http_mock.get = AsyncMock(return_value=resp)
     http_mock.aclose = AsyncMock()
+    return EdgarClient(mock_settings, http_client=http_mock)
 
-    client = EdgarClient(mock_settings, http_client=http_mock)
-    with caplog.at_level(logging.WARNING, logger="alphalens.etl.edgar"):
+
+@pytest.mark.asyncio
+async def test_list_filings_logs_normal_overflow_at_info(
+    mock_settings: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Overflow with usable bounds is the expected path since the S-fix → INFO, not WARNING."""
+    client = _overflow_client(
+        mock_settings,
+        {
+            "name": "CIK0000320193-submissions-001.json",
+            "filingFrom": "2022-03-01",
+            "filingTo": "2023-04-01",
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="alphalens.etl.edgar"):
         result = await client.list_filings("0000320193")
 
     assert result == []
-    assert "overflow" in caplog.text.lower()
+    info_text = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.INFO)
+    assert "overflow" in info_text.lower()
     assert "0000320193" in caplog.text
+    # The anomaly channel stays silent on the happy path.
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.asyncio
+async def test_list_filings_warns_on_unusable_page_bounds(
+    mock_settings: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Missing/unparseable filingFrom-filingTo → fetch-on-unknown, and that IS a WARNING."""
+    client = _overflow_client(mock_settings, {"name": "CIK0000320193-submissions-001.json"})
+
+    with caplog.at_level(logging.INFO, logger="alphalens.etl.edgar"):
+        result = await client.list_filings("0000320193")
+
+    assert result == []
+    warn_text = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "CIK0000320193-submissions-001.json" in warn_text
+    assert "0000320193" in warn_text
 
 
 @pytest.mark.asyncio
@@ -222,6 +250,138 @@ async def test_list_filings_no_warning_without_overflow(
 
     assert result == []
     assert "overflow" not in caplog.text.lower()
+
+
+# ── S-fix AC #8: _page_overlaps (overlap / no-overlap / boundary-touch) ───────
+
+_WINDOW_FROM = date(2022, 1, 1)
+_WINDOW_TO = date(2026, 12, 31)
+
+
+def _page(frm: str, to: str) -> dict[str, Any]:
+    return {"name": "CIK0000019617-submissions-001.json", "filingFrom": frm, "filingTo": to}
+
+
+@pytest.mark.parametrize(
+    ("frm", "to", "expected", "why"),
+    [
+        # -- overlapping --
+        ("2023-01-01", "2023-06-30", True, "fully inside the window"),
+        ("2020-01-01", "2027-12-31", True, "strictly contains the window"),
+        ("2021-06-01", "2022-06-01", True, "straddles the lower bound"),
+        ("2026-06-01", "2027-06-01", True, "straddles the upper bound"),
+        # -- boundary touch (inclusive on both ends) --
+        ("2020-01-01", "2022-01-01", True, "filingTo == date_from"),
+        ("2026-12-31", "2027-06-01", True, "filingFrom == date_to"),
+        ("2022-01-01", "2026-12-31", True, "exactly the window"),
+        # -- no overlap (one day clear of each boundary) --
+        ("2020-01-01", "2021-12-31", False, "ends the day before date_from"),
+        ("2027-01-01", "2027-12-31", False, "starts the day after date_to"),
+    ],
+)
+def test_page_overlaps(frm: str, to: str, expected: bool, why: str) -> None:
+    """AC #8: overlap rule is filingTo >= date_from AND filingFrom <= date_to."""
+    assert EdgarClient._page_overlaps(_page(frm, to), _WINDOW_FROM, _WINDOW_TO) is expected, why
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {"name": "x.json"},  # no bounds at all
+        {"name": "x.json", "filingFrom": "2020-01-01"},  # half bounds
+        {"name": "x.json", "filingFrom": "", "filingTo": ""},  # empty strings
+        {"name": "x.json", "filingFrom": "not-a-date", "filingTo": "2021-01-01"},  # unparseable
+    ],
+)
+def test_page_overlaps_fetches_when_bounds_unusable(page: dict[str, Any]) -> None:
+    """Unknown/broken bounds must fetch, never silently skip — that's the bug being fixed."""
+    assert EdgarClient._page_overlaps(page, _WINDOW_FROM, _WINDOW_TO) is True
+
+
+# ── S-fix AC #1-#5: overflow pages are read, filtered, merged, deduped ─────────
+
+
+def _block(rows: list[tuple[str, str, str, str, str]]) -> dict[str, list[str]]:
+    """Build a flat parallel-array block: (form, filingDate, reportDate, accession, doc)."""
+    return {
+        "form": [r[0] for r in rows],
+        "filingDate": [r[1] for r in rows],
+        "reportDate": [r[2] for r in rows],
+        "accessionNumber": [r[3] for r in rows],
+        "primaryDocument": [r[4] for r in rows],
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_filings_reads_only_overlapping_overflow_pages(
+    mock_settings: MagicMock,
+) -> None:
+    """AC #1-#5: overlapping page fetched + parsed + merged + deduped; stale page never GET."""
+    root: dict[str, Any] = {
+        "filings": {
+            "recent": _block(
+                [("10-K", "2025-02-13", "2024-12-31", "0000019617-25-000123", "jpm-2024.htm")]
+            ),
+            "files": [
+                # overlaps -> must be fetched
+                {
+                    "name": "page-in.json",
+                    "filingFrom": "2022-01-05",
+                    "filingTo": "2023-06-30",
+                },
+                # entirely before the window -> must NOT be fetched
+                {
+                    "name": "page-out.json",
+                    "filingFrom": "2019-01-01",
+                    "filingTo": "2021-12-31",
+                },
+            ],
+        }
+    }
+    page_in: dict[str, list[str]] = _block(
+        [
+            # duplicate of the recent row -> must dedup to one
+            ("10-K", "2025-02-13", "2024-12-31", "0000019617-25-000123", "jpm-2024.htm"),
+            # new, in-window -> must appear
+            ("10-K", "2023-02-21", "2022-12-31", "0000019617-23-000456", "jpm-2022.htm"),
+            # right form, out of window -> filtered
+            ("10-K", "2021-02-23", "2020-12-31", "0000019617-21-000789", "jpm-2020.htm"),
+            # in window, wrong form -> filtered
+            ("424B2", "2023-03-01", "", "0001213900-23-000111", "note.htm"),
+        ]
+    )
+
+    requested: list[str] = []
+
+    async def fake_get(url: str, **kwargs: Any) -> MagicMock:
+        requested.append(url)
+        resp: MagicMock = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=page_in if "page-in.json" in url else root)
+        return resp
+
+    http_mock: MagicMock = MagicMock(spec=httpx.AsyncClient)
+    http_mock.get = AsyncMock(side_effect=fake_get)
+    http_mock.aclose = AsyncMock()
+
+    client = EdgarClient(mock_settings, http_client=http_mock)
+    result = await client.list_filings("0000019617")
+
+    assert any("page-in.json" in u for u in requested), "overlapping page must be fetched"
+    assert not any("page-out.json" in u for u in requested), "stale page must not be fetched"
+    assert len(requested) == 2, f"expected root + 1 overlapping page, got {requested}"
+
+    accessions = [f.accession_number for f in result]
+    assert accessions == ["0000019617-25-000123", "0000019617-23-000456"]
+    assert len(set(accessions)) == len(accessions), "AC #5: dedup on accession_number"
+    # AC #4: the same form + date filters applied to the overflow rows.
+    assert all(f.form_type in {"10-K", "10-Q"} for f in result)
+    assert all(date(2022, 1, 1) <= f.filing_date <= date(2026, 12, 31) for f in result)
+    # Overflow rows are fully-formed FilingMetadata, not a degraded shape.
+    recovered = result[1]
+    assert recovered.period_of_report == date(2022, 12, 31)
+    assert recovered.primary_doc_filename == "jpm-2022.htm"
+    assert "000001961723000456" in recovered.primary_doc_url
 
 
 # ── AC #11: Live SEC integration (skip by default) ────────────────────────────
