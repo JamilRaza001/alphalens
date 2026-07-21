@@ -59,7 +59,7 @@ class Settings(BaseSettings):
 
     # ── LLM — Groq (L8) ───────────────────────────────────────────────────────
     groq_api_key: SecretStr
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
     # Synthesize-node temperature ONLY (S16/D-temp). Plan + Evaluate pin temperature=0
     # invariantly at their call sites (structured decoding depends on it, S13 lock) and ignore
     # this value. Default 0.0 → deterministic v1 synthesis; env GROQ_TEMPERATURE tunes it.
