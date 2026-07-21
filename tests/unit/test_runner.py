@@ -34,6 +34,9 @@ _CIK = "0000320193"
 _TICKER = "AAPL"
 _ACC = "0000320193-24-000001"
 _R2_KEY = f"filings/{_CIK}/{_ACC}.html"
+_PRIMARY_DOC_URL = (
+    "https://www.sec.gov/Archives/edgar/data/320193/000032019324000001/aapl-20231230.htm"
+)
 _HTML = b"<html><body>10-K content</body></html>"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -59,6 +62,7 @@ def _filing_row() -> dict[str, Any]:
         "period_end": date(2023, 12, 31),
         "accession_number": _ACC,
         "r2_key": _R2_KEY,
+        "primary_doc_url": _PRIMARY_DOC_URL,
     }
 
 
@@ -78,7 +82,8 @@ class _FakeConn:
 
     Routing:
       fetch  — "companies" → company_rows; "pending" → pending_rows; else []
-      fetchval — "INSERT INTO filings" → insert_return; "COUNT" → attempt_count;
+      fetchval — "INSERT INTO filings" → insert_return (xmax=0 inserted bool);
+                 "COUNT" → attempt_count;
                  "RETURNING job_id" → job_id; "RETURNING filing_id" → filing_id;
                  else None
       fetchrow — "FROM filings WHERE filing_id" → filing_row; else None
@@ -89,7 +94,7 @@ class _FakeConn:
         self,
         *,
         company_rows: list[dict[str, Any]] | None = None,
-        insert_return: UUID | None = _FILING_ID,
+        insert_return: bool | None = True,
         pending_rows: list[UUID] | None = None,
         attempt_count: int = 0,
         job_id: UUID = _JOB_ID,
@@ -191,6 +196,7 @@ def _fake_filing_meta(accession_number: str = _ACC) -> MagicMock:
     m.form_type = "10-K"
     m.filing_date = date(2024, 1, 15)
     m.period_of_report = date(2023, 12, 31)
+    m.primary_doc_url = _PRIMARY_DOC_URL
     return m
 
 
@@ -201,7 +207,7 @@ async def test_ac1_discover_reads_companies_table() -> None:
     """AC#1: discover fetches CIKs from companies; list_filings called once per CIK."""
     conn = _FakeConn(
         company_rows=[{"ticker": _TICKER, "cik": _CIK}],
-        insert_return=_FILING_ID,
+        insert_return=True,
     )
     pool = _FakePool(conn)
     edgar_ctx = _mock_edgar_ctx(list_filings_return=[_fake_filing_meta()])
@@ -247,10 +253,10 @@ async def test_ac2_discover_filters_via_edgar_defaults() -> None:
 
 
 async def test_ac3_discover_idempotent_on_conflict() -> None:
-    """AC#3: ON CONFLICT (accession_number) DO NOTHING → filings_enqueued=0 on re-run."""
+    """AC#3: full-dup re-run (already-populated rows → no RETURNING row) → enqueued=0."""
     conn = _FakeConn(
         company_rows=[{"ticker": _TICKER, "cik": _CIK}],
-        insert_return=None,  # RETURNING yields nothing on conflict
+        insert_return=None,  # conflict + primary_doc_url already set → WHERE fails → no row
     )
     pool = _FakePool(conn)
     edgar_ctx = _mock_edgar_ctx(list_filings_return=[_fake_filing_meta()])
@@ -262,11 +268,11 @@ async def test_ac3_discover_idempotent_on_conflict() -> None:
         report = await discover(_make_settings())
 
     assert report.filings_enqueued == 0
-    # INSERT SQL must contain ON CONFLICT DO NOTHING
+    # INSERT SQL uses the guarded ON CONFLICT DO UPDATE (backfill), not DO NOTHING.
     insert_sqls = [s for s in conn.fetchval_sqls if "INSERT INTO filings" in s]
     assert insert_sqls, "expected at least one INSERT INTO filings"
-    assert all("ON CONFLICT" in s for s in insert_sqls)
-    assert all("DO NOTHING" in s for s in insert_sqls)
+    assert all("ON CONFLICT (accession_number) DO UPDATE" in s for s in insert_sqls)
+    assert all("DO NOTHING" not in s for s in insert_sqls)
 
 
 # ── AC#4 — discover INSERT never references r2_key ───────────────────────────
@@ -276,7 +282,7 @@ async def test_ac4_discover_insert_omits_r2_key() -> None:
     """AC#4: the INSERT SQL must not mention r2_key (it is a generated column)."""
     conn = _FakeConn(
         company_rows=[{"ticker": _TICKER, "cik": _CIK}],
-        insert_return=_FILING_ID,
+        insert_return=True,
     )
     pool = _FakePool(conn)
     edgar_ctx = _mock_edgar_ctx(list_filings_return=[_fake_filing_meta()])
@@ -291,6 +297,32 @@ async def test_ac4_discover_insert_omits_r2_key() -> None:
     assert insert_sqls, "expected an INSERT INTO filings call"
     for sql in insert_sqls:
         assert "r2_key" not in sql, f"r2_key must not appear in INSERT SQL; got:\n{sql}"
+        assert "primary_doc_url" in sql, f"INSERT must persist primary_doc_url; got:\n{sql}"
+
+
+async def test_discover_backfill_update_not_counted_as_enqueued() -> None:
+    """Backfill (ON CONFLICT DO UPDATE, xmax != 0) returns inserted=False → not enqueued."""
+    conn = _FakeConn(
+        company_rows=[{"ticker": _TICKER, "cik": _CIK}],
+        insert_return=False,  # existing row backfilled, not a new insert
+    )
+    pool = _FakePool(conn)
+    edgar_ctx = _mock_edgar_ctx(list_filings_return=[_fake_filing_meta()])
+
+    with (
+        patch("alphalens.etl.runner.asyncpg.create_pool", AsyncMock(return_value=pool)),
+        patch("alphalens.etl.runner.EdgarClient", return_value=edgar_ctx),
+    ):
+        report = await discover(_make_settings())
+
+    assert report.filings_enqueued == 0
+    # DO UPDATE clause is guarded to a single NULL column and counts via xmax.
+    insert_sqls = [s for s in conn.fetchval_sqls if "INSERT INTO filings" in s]
+    assert insert_sqls
+    for sql in insert_sqls:
+        assert "ON CONFLICT (accession_number) DO UPDATE" in sql
+        assert "filings.primary_doc_url IS NULL" in sql
+        assert "xmax = 0" in sql
 
 
 # ── AC#5 — run processes filings sequentially (D3) ───────────────────────────
@@ -448,6 +480,23 @@ async def test_ac8_embed_failure_calls_fail_attempt() -> None:
     assert "quota exceeded" in args[3]
     # A1 (#3): start_attempt + fail_attempt each run inside conn.transaction().
     assert conn.transaction_calls >= 2
+
+
+# ── primary_doc_url NULL guard — no re-list fallback ─────────────────────────
+
+
+async def test_process_one_raises_on_null_primary_doc_url() -> None:
+    """A claimed row with NULL primary_doc_url raises explicitly; no EDGAR re-list."""
+    row = _filing_row()
+    row["primary_doc_url"] = None
+    conn = _FakeConn(filing_row=row)
+    pool = _FakePool(conn)
+
+    with pytest.raises(RuntimeError, match="primary_doc_url missing"):
+        await _process_one(_FILING_ID, settings=_make_settings(), pool=pool)
+
+    # Guard fires before any attempt is opened — no state-machine work done.
+    assert conn.transaction_calls == 0
 
 
 # ── AC#9 — run is resumable (skips empty claim on re-invoke) ─────────────────

@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from alphalens.config import Settings, get_settings
 from alphalens.etl.chunker import Chunker
-from alphalens.etl.edgar import EdgarClient
+from alphalens.etl.edgar import EdgarClient, FilingMetadata
 from alphalens.etl.embeddings import EmbeddingClient
 from alphalens.etl.sections import SectionDetector
 from alphalens.etl.state import (
@@ -47,7 +47,7 @@ class DiscoverReport:
 
     companies_scanned: int
     filings_found: int
-    filings_enqueued: int  # newly inserted; ON CONFLICT DO NOTHING skips dupes
+    filings_enqueued: int  # true inserts only (xmax=0); backfill updates excluded
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +65,9 @@ class RunReport:
 async def discover(settings: Settings, *, tickers: list[str] | None = None) -> DiscoverReport:
     """List 2022-2026 10-K/10-Q filings for target companies (from the companies
     table) and enqueue them as status='pending'. Idempotent on accession_number.
-    Never writes r2_key. `tickers=None` means all seeded companies."""
+    Captures primary_doc_url on new inserts and backfills it on existing rows
+    where it IS NULL (ON CONFLICT DO UPDATE). Never writes r2_key. `filings_enqueued`
+    counts true inserts only (xmax=0). `tickers=None` means all seeded companies."""
     pool: asyncpg.Pool[asyncpg.Record] = await asyncpg.create_pool(
         settings.neon_database_url.get_secret_value(),
         min_size=1,
@@ -91,21 +93,26 @@ async def discover(settings: Settings, *, tickers: list[str] | None = None) -> D
                 total_found += len(filings)
                 async with pool.acquire() as conn:
                     for f in filings:
-                        result: UUID | None = await conn.fetchval(
+                        # inserted=True → new row; False → backfilled existing row;
+                        # None → conflict where primary_doc_url already set (no row).
+                        inserted: bool | None = await conn.fetchval(
                             "INSERT INTO filings"
                             " (ticker, cik, filing_type, filing_date,"
-                            "  period_end, accession_number)"
-                            " VALUES ($1, $2, $3, $4, $5, $6)"
-                            " ON CONFLICT (accession_number) DO NOTHING"
-                            " RETURNING filing_id",
+                            "  period_end, accession_number, primary_doc_url)"
+                            " VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                            " ON CONFLICT (accession_number) DO UPDATE"
+                            "   SET primary_doc_url = EXCLUDED.primary_doc_url"
+                            "   WHERE filings.primary_doc_url IS NULL"
+                            " RETURNING (xmax = 0) AS inserted",
                             ticker,
                             cik,
                             f.form_type,
                             f.filing_date,
                             f.period_of_report,
                             f.accession_number,
+                            f.primary_doc_url,
                         )
-                        if result is not None:
+                        if inserted:
                             total_enqueued += 1
 
         _log.info(
@@ -183,7 +190,7 @@ async def _process_one(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT cik, filing_type, filing_date, period_end,"
-            " accession_number, r2_key"
+            " accession_number, r2_key, primary_doc_url"
             " FROM filings WHERE filing_id = $1",
             filing_id,
         )
@@ -194,7 +201,11 @@ async def _process_one(
     cik: str = row["cik"]
     accession_number: str = row["accession_number"]
     filing_date: date = row["filing_date"]
+    period_end: date = row["period_end"]
     form_type = cast(Literal["10-K", "10-Q"], row["filing_type"])
+    primary_doc_url: str | None = row["primary_doc_url"]
+    if primary_doc_url is None:
+        raise RuntimeError(f"primary_doc_url missing for {accession_number}, re-run discover")
 
     # MaxAttemptsReached propagates to run() — no job row was created, no fail_attempt needed
     async with pool.acquire() as conn, conn.transaction():
@@ -205,18 +216,20 @@ async def _process_one(
         async with pool.acquire() as conn:
             await record_step(conn, job_id, IngestionStep.DOWNLOAD)
 
+        # Reconstruct FilingMetadata from the claimed row — primary_doc_url was
+        # captured at discover-time, so no EDGAR re-list (killed the single-day
+        # dead-zone window, Session-36). Basename of the URL is the primary-doc
+        # filename by construction (edgar._ARCHIVES_URL); fetch uses r2_cache_key.
+        meta = FilingMetadata(
+            cik=cik,
+            accession_number=accession_number,
+            form_type=form_type,
+            filing_date=filing_date,
+            period_of_report=period_end,
+            primary_doc_url=primary_doc_url,
+            primary_doc_filename=primary_doc_url.rsplit("/", 1)[-1],
+        )
         async with EdgarClient(settings) as edgar:
-            metas = await edgar.list_filings(
-                cik,
-                form_types=(form_type,),
-                date_from=filing_date,
-                date_to=filing_date,
-            )
-            meta = next((m for m in metas if m.accession_number == accession_number), None)
-            if meta is None:
-                raise RuntimeError(
-                    f"accession {accession_number!r} not in EDGAR listing for CIK {cik}"
-                )
             html = await edgar.fetch_primary_doc(meta)
 
         await _upload_html_to_r2(r2_key, html, settings=settings)
