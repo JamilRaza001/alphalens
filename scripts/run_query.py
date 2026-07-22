@@ -64,6 +64,8 @@ async def run_query(question: str, *, user_id: str | None = None) -> None:
         print(
             f"\nconfidence={final_state['confidence']} "
             f"reason={final_state['confidence_reason']} "
+            f"coverage_gaps={final_state['coverage_gaps']} "
+            f"capacity_drops={final_state['capacity_drops']} "
             f"unavailable={final_state['unavailable_tickers']} "
             f"unavailable_years={final_state['unavailable_years']} "
             f"latency={time.monotonic() - t0:.2f}s"
