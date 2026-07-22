@@ -515,10 +515,26 @@ async def rerank_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict
 async def evaluate_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[str, Any]:
     plan = state["query_plan"]
     reranked = state["reranked_chunks"]
-    gaps = compute_coverage_gaps(plan, reranked)
-    if gaps:  # structural signal wins (precedence) -- LLM call skipped (token saving)
-        return {"confidence": "low", "confidence_reason": "coverage", "coverage_gaps": gaps}
 
+    raw_gaps = compute_coverage_gaps(plan, reranked)  # needed - present (helper UNCHANGED)
+    capacity = set(state["dropped_for_capacity"])  # pairs trimmed by the S17 floor (rerank_node)
+
+    # Partition the raw misses by CAUSE. A pair absent from `present` is a real coverage
+    # gap ONLY if it was not budget-trimmed; if it's in the capacity set, its evidence
+    # existed and was cut for context space -- that is not "missing".
+    coverage_gaps = [p for p in raw_gaps if p not in capacity]
+    capacity_drops = [p for p in raw_gaps if p in capacity]
+
+    if coverage_gaps:  # TRUE evidence gap -> structural precedence wins, LLM call skipped
+        return {
+            "confidence": "low",
+            "confidence_reason": "coverage",
+            "coverage_gaps": coverage_gaps,
+            "capacity_drops": capacity_drops,
+        }
+
+    # No true gap. Capacity drops (if any) do NOT force low -- the LLM judges sufficiency
+    # over the context it actually has.
     # temperature=0 pinned INVARIANTLY (S16/D-temp), same rationale as plan_node.
     deterministic = runtime.context.llm.model_copy(update={"temperature": 0.0})
     structured = deterministic.with_structured_output(
@@ -536,8 +552,18 @@ async def evaluate_node(state: AgentState, runtime: Runtime[AgentContext]) -> di
         ),
     )
     if not verdict.sufficient:
-        return {"confidence": "low", "confidence_reason": "llm", "coverage_gaps": []}
-    return {"confidence": "high", "confidence_reason": "none", "coverage_gaps": []}
+        return {
+            "confidence": "low",
+            "confidence_reason": "llm",
+            "coverage_gaps": [],
+            "capacity_drops": capacity_drops,
+        }
+    return {
+        "confidence": "high",
+        "confidence_reason": "none",
+        "coverage_gaps": [],
+        "capacity_drops": capacity_drops,
+    }
 
 
 # ── Node 5: Synthesize -- Groq stream + citations + honesty-rail ──────────────

@@ -180,6 +180,7 @@ def _state(**overrides: Any) -> AgentState:
         "confidence": "high",
         "confidence_reason": "none",
         "coverage_gaps": [],
+        "capacity_drops": [],
         "citations": [],
         "answer_stream": None,
     }
@@ -359,6 +360,7 @@ async def test_evaluate_node_coverage_precedence() -> None:
         "confidence": "low",
         "confidence_reason": "coverage",
         "coverage_gaps": [("MSFT", 2023)],
+        "capacity_drops": [],
     }
     assert llm.structured_calls == []  # LLM sufficiency NOT invoked (precedence)
 
@@ -372,7 +374,12 @@ async def test_evaluate_node_llm_insufficient() -> None:
     )
     out = await evaluate_node(state, _runtime(ctx))
 
-    assert out == {"confidence": "low", "confidence_reason": "llm", "coverage_gaps": []}
+    assert out == {
+        "confidence": "low",
+        "confidence_reason": "llm",
+        "coverage_gaps": [],
+        "capacity_drops": [],
+    }
     assert len(llm.structured_calls) == 1  # LLM WAS consulted (no gaps)
 
 
@@ -385,7 +392,104 @@ async def test_evaluate_node_high() -> None:
     )
     out = await evaluate_node(state, _runtime(ctx))
 
-    assert out == {"confidence": "high", "confidence_reason": "none", "coverage_gaps": []}
+    assert out == {
+        "confidence": "high",
+        "confidence_reason": "none",
+        "coverage_gaps": [],
+        "capacity_drops": [],
+    }
+
+
+# ── Evaluate node: capacity-drop vs coverage-gap split (S_C1) ──────────────────
+
+
+async def test_evaluate_node_capacity_only_no_coverage() -> None:
+    # AC1 (S4 regression guard): every raw miss is a capacity drop, so there is NO true
+    # coverage gap -> Evaluate must NOT take the coverage-precedence path. It proceeds to the
+    # LLM branch and returns the LLM's verdict; capacity_drops holds the trimmed pairs.
+    llm = _FakeLLM(structured_result=EvalVerdict(reasoning="enough", sufficient=True))
+    ctx = _ctx(llm=llm)
+    state = _state(
+        query_plan=_plan(["AAPL", "MSFT"], [2023]),
+        reranked_chunks=[ScoredChunk(chunk=_chunk("c1", "AAPL", 2023), rerank_score=1.0)],
+        dropped_for_capacity=[("MSFT", 2023)],  # the only miss was budget-trimmed
+    )
+    out = await evaluate_node(state, _runtime(ctx))
+
+    assert out == {
+        "confidence": "high",
+        "confidence_reason": "none",
+        "coverage_gaps": [],
+        "capacity_drops": [("MSFT", 2023)],
+    }
+    assert out["confidence_reason"] != "coverage"  # NEVER the coverage path
+    assert len(llm.structured_calls) == 1  # LLM WAS consulted (capacity is not a hard gap)
+
+
+async def test_evaluate_node_true_gap() -> None:
+    # AC2: a miss NOT in dropped_for_capacity is a real evidence gap -> low/coverage, LLM skipped.
+    llm = _FakeLLM(structured_result=EvalVerdict(reasoning="unused", sufficient=True))
+    ctx = _ctx(llm=llm)
+    state = _state(
+        query_plan=_plan(["AAPL", "MSFT"], [2023]),
+        reranked_chunks=[ScoredChunk(chunk=_chunk("c1", "AAPL", 2023), rerank_score=1.0)],
+        dropped_for_capacity=[],  # nothing was trimmed -> the miss is genuine
+    )
+    out = await evaluate_node(state, _runtime(ctx))
+
+    assert out == {
+        "confidence": "low",
+        "confidence_reason": "coverage",
+        "coverage_gaps": [("MSFT", 2023)],
+        "capacity_drops": [],
+    }
+    assert llm.structured_calls == []  # precedence -> LLM sufficiency NOT invoked
+
+
+async def test_evaluate_node_mixed_gap_and_capacity() -> None:
+    # AC3: one true gap + one capacity drop. coverage precedence still fires on the true gap;
+    # the two lists are disjoint and together partition raw_gaps.
+    llm = _FakeLLM(structured_result=EvalVerdict(reasoning="unused", sufficient=True))
+    ctx = _ctx(llm=llm)
+    # needed = {AAPL,MSFT,GOOGL} x {2023}; present = {AAPL}; raw_gaps = {MSFT, GOOGL}.
+    state = _state(
+        query_plan=_plan(["AAPL", "MSFT", "GOOGL"], [2023]),
+        reranked_chunks=[ScoredChunk(chunk=_chunk("c1", "AAPL", 2023), rerank_score=1.0)],
+        dropped_for_capacity=[("GOOGL", 2023)],  # GOOGL trimmed; MSFT genuinely missing
+    )
+    out = await evaluate_node(state, _runtime(ctx))
+
+    assert out == {
+        "confidence": "low",
+        "confidence_reason": "coverage",
+        "coverage_gaps": [("MSFT", 2023)],
+        "capacity_drops": [("GOOGL", 2023)],
+    }
+    assert llm.structured_calls == []  # true gap present -> precedence, LLM skipped
+    # disjoint, and together partition the raw misses.
+    coverage = set(out["coverage_gaps"])
+    capacity = set(out["capacity_drops"])
+    assert coverage.isdisjoint(capacity)
+    assert coverage | capacity == {("MSFT", 2023), ("GOOGL", 2023)}
+
+
+async def test_evaluate_node_no_gap_capacity_empty() -> None:
+    # AC4: no raw misses at all -> LLM branch exactly as pre-fix; capacity_drops present + empty.
+    llm = _FakeLLM(structured_result=EvalVerdict(reasoning="complete", sufficient=True))
+    ctx = _ctx(llm=llm)
+    state = _state(
+        query_plan=_plan(["AAPL"], [2023]),
+        reranked_chunks=[ScoredChunk(chunk=_chunk("c1", "AAPL", 2023), rerank_score=1.0)],
+    )
+    out = await evaluate_node(state, _runtime(ctx))
+
+    assert out == {
+        "confidence": "high",
+        "confidence_reason": "none",
+        "coverage_gaps": [],
+        "capacity_drops": [],
+    }
+    assert len(llm.structured_calls) == 1
 
 
 # ── Synthesize node ───────────────────────────────────────────────────────────

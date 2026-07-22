@@ -179,6 +179,11 @@ class AgentState(TypedDict):
     confidence: Literal["low", "high"]  # D1
     confidence_reason: Literal["coverage", "llm", "none"]  # D3
     coverage_gaps: list[tuple[str, int]]  # missing (ticker, year); [] = full
+    # (ticker, year) pairs that surfaced as coverage-check misses but whose cause is the
+    # S17 capacity floor (see dropped_for_capacity), NOT absent evidence. Written once by
+    # evaluate_node; read by NO node in v1 -- kept as inspectable v2 signal (how many needed
+    # cells went to budget vs genuinely missing). No reducer -- replaced.
+    capacity_drops: list[tuple[str, int]]
 
     # -- Final output --
     citations: list[Citation]
