@@ -79,6 +79,7 @@ def _plan(tickers: list[str], years: list[int], sub_questions: list[str]) -> Que
         time_range=TimeRange(years=years),
         sub_questions=sub_questions,
         entities=[],
+        unresolved_companies=[],
     )
 
 
@@ -110,6 +111,7 @@ def _state(plan: QueryPlan) -> AgentState:
         "user_id": None,
         "query_plan": plan,
         "unavailable_tickers": [],
+        "unavailable_companies": [],
         "unavailable_years": [],
         "query": "q",
         "iteration": 0,

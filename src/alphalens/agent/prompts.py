@@ -34,6 +34,8 @@ bake company names or years into a sub_question: the tickers and time_range.year
 already carry those, and each topic is evaluated against every (ticker, year) combination. \
 One topic per distinct metric -- never one sub_question per company or per year.
 - entities: salient non-ticker entities (people, products, segments, financial metrics).
+- unresolved_companies: every company the question names that is NOT in the roster below, \
+copied verbatim as the user wrote it -- never a guessed ticker.
 
 Examples (time_range.years):
 - "2023 vs 2024" -> years: [2023, 2024]
@@ -48,6 +50,13 @@ Examples (sub_questions -- topic only, no company/year):
 topic cross-binds it to the wrong filings and is always wrong.
 - "How did Tesla's revenue and net income change in 2024?"
   -> sub_questions: ["revenue", "net income"]   (two topics, no ticker or year)
+
+Examples (tickers / unresolved_companies):
+- "Apple vs Microsoft" -> tickers: [AAPL, MSFT], unresolved_companies: []
+- "Compare Coca-Cola and Apple" -> tickers: [AAPL], unresolved_companies: ["Coca-Cola"]
+  NEVER tickers: [AAPL] with unresolved_companies: [] -- that drops Coca-Cola from the answer \
+silently and is always wrong.
+- "Ford's revenue" -> tickers: [], unresolved_companies: ["Ford"]
 
 The corpus only covers these companies (TICKER — Company name):
 {roster}
@@ -153,12 +162,18 @@ def build_synthesize_user_msg(
     unavailable_tickers: list[str],
     unavailable_years: list[int],
     dropped_for_capacity: list[tuple[str, int]],
+    unavailable_companies: list[str],
 ) -> str:
     """Assemble the human turn: question, evidence, confidence flag, the unavailable-ticker /
-    unavailable-year notes (both worded distinctly from coverage gaps), and -- only when
-    non-empty -- the capacity-dropped (ticker, year) pairs (S17 honesty rail; emitted as
-    nothing on normal queries to avoid disclosure noise)."""
+    unavailable-company / unavailable-year notes (all worded distinctly from coverage gaps),
+    and -- only when non-empty -- the capacity-dropped (ticker, year) pairs (S17 honesty rail;
+    emitted as nothing on normal queries to avoid disclosure noise).
+
+    The company note carries NAMES the Plan LLM could not resolve to the roster at all
+    ("Coca-Cola"); the ticker note carries SYMBOLS it emitted that failed the allowlist gate
+    ("KO"). Different provenance, so they are rendered as separate labelled lines."""
     unavailable = ", ".join(unavailable_tickers) if unavailable_tickers else "(none)"
+    bad_companies = ", ".join(unavailable_companies) if unavailable_companies else "(none)"
     bad_years = ", ".join(str(y) for y in unavailable_years) if unavailable_years else "(none)"
     # Conditional disclosure block: rendered ONLY when capacity forced pairs out (S17). Empty
     # -> emit nothing, so ordinary answers carry no capacity-note noise.
@@ -173,6 +188,7 @@ def build_synthesize_user_msg(
         f"User question:\n{query}\n\n"
         f"Confidence flag: {confidence}\n"
         f"Unavailable (out-of-corpus) tickers: {unavailable}\n"
+        f"Unavailable (out-of-corpus) companies: {bad_companies}\n"
         f"Unavailable (out-of-coverage) years: {bad_years}\n"
         f"{capacity_note}\n"
         f"Retrieved evidence:\n{_render_evidence(reranked)}"

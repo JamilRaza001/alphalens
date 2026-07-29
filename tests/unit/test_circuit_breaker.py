@@ -395,6 +395,7 @@ async def test_synthesize_node_routes_open_breaker_to_degraded() -> None:
             "user_id": None,
             "query_plan": None,
             "unavailable_tickers": [],
+            "unavailable_companies": [],
             "unavailable_years": [],
             "query": "q",
             "iteration": 0,

@@ -91,6 +91,66 @@ def validate_tickers(requested: list[str], allowed: frozenset[str]) -> tuple[lis
     return kept, dropped
 
 
+# What this threshold CUTS: the densest tail of prefix over-matching, where a 1-2 char needle
+# collides with almost anything -- "V" would match "Visa Inc.". Those fall back to exact
+# equality.
+# What SURVIVES above it: over-matching does NOT stop at 3 chars. "Alpha" still matches
+# "Alphabet Inc.", so a non-roster company named Alpha is judged in-roster and DISCARDED --
+# silently, the S5b failure returning through this gate. A threshold trims a tail; it does not
+# close a class. See validate_companies' third residual.
+_MIN_COMPANY_PREFIX = 3
+
+
+def _matches_roster(emitted: str, legal_names: list[str]) -> bool:
+    """True iff an emitted company name denotes a roster company (see validate_companies)."""
+    needle = emitted.casefold().strip()
+    if len(needle) < _MIN_COMPANY_PREFIX:
+        return needle in legal_names
+    return any(name.startswith(needle) for name in legal_names)
+
+
+def validate_companies(
+    unresolved: list[str], roster: Mapping[str, str]
+) -> tuple[list[str], list[str]]:
+    """Split LLM-declared unresolved company names into (confirmed_unavailable, false_positives).
+
+    NOT a hard gate, and asymmetric to ``validate_tickers`` / ``validate_years`` BY NECESSITY.
+    Those two see the full candidate list and filter it exhaustively. This one cannot: it never
+    sees the query text, so it cannot know a company was named and then omitted from BOTH
+    lists. It catches FALSE POSITIVES only -- a name the model called unresolved that is in
+    fact in the roster. Completeness rests on the Plan prompt's worked negative example, so
+    this REDUCES the silent-drop failure class rather than eliminating it.
+
+    Matching closes LEGAL-SUFFIX variance and NOTHING else: the roster holds legal names
+    ("Apple Inc.") while the model is asked for the user's wording ("Apple"), so a legal name
+    that STARTS WITH the emitted name counts as in-roster. Direction is fixed -- the legal
+    name is the haystack, never the reverse.
+
+    THREE variance classes stay OPEN, running in TWO OPPOSITE failure directions.
+
+    UNDER-match -> false CONFIRM (an in-corpus company is denied in the footer while the body
+    cites its ticker). ``startswith`` is left-anchored and ``casefold()`` normalizes case
+    only -- not punctuation, not whitespace:
+      - SEMANTIC alias: "Google" does not match "Alphabet Inc.".
+      - PUNCTUATION / WHITESPACE: "JP Morgan" does not match "JPMorgan Chase & Co." (the
+        comparison fails at index 2, space vs 'm'). "Amazon" matches "Amazon.com Inc." only
+        because the divergence happens to fall after the needle ends.
+
+    OVER-match -> false SUPPRESS, the OPPOSITE direction and the more dangerous one:
+      - PREFIX COLLISION: "Alpha" matches "Alphabet Inc.", so a non-roster company named Alpha
+        is judged in-roster, lands in false_pos, and is DISCARDED. The user never sees the
+        disclosure -- that is the S5b silent drop returning through the gate built to reduce
+        it. ``_MIN_COMPANY_PREFIX`` trims the short-needle tail of this class; it does not
+        close it.
+
+    All three are the deferred v2 alias-table item. Do NOT read this gate as closing them.
+    """
+    legal_names = [name.casefold().strip() for name in roster.values()]
+    confirmed = [c for c in unresolved if not _matches_roster(c, legal_names)]
+    false_pos = [c for c in unresolved if _matches_roster(c, legal_names)]
+    return confirmed, false_pos
+
+
 def split_concatenated_years(requested: list[int]) -> list[int]:
     """Repair years the LLM concatenated into one integer: 20232024 -> [2023, 2024].
 
@@ -174,6 +234,15 @@ async def plan_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[s
     plan = cast(QueryPlan, await structured.ainvoke(messages))
     kept, dropped = validate_tickers(plan.tickers, runtime.context.allowed_tickers)
     plan.tickers = kept  # drop-and-note (partial-query policy)
+    # Companies the model itself declared out-of-roster. Only FALSE POSITIVES are filterable
+    # here (validate_companies cannot see the query); they are dropped, never promoted into
+    # plan.tickers -- promoting would invent a retrieval cell the plan never asked for.
+    confirmed, false_pos = validate_companies(
+        plan.unresolved_companies, runtime.context.ticker_roster
+    )
+    if false_pos:
+        _log.warning("Plan listed in-roster companies as unresolved: %s", false_pos)
+    plan.unresolved_companies = confirmed
     # Repair concatenated years BEFORE the bounds gate: a repaired, in-bounds year must flow to
     # retrieval normally rather than be dropped as garbage.
     repaired = split_concatenated_years(plan.time_range.years)
@@ -186,6 +255,7 @@ async def plan_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[s
     return {
         "query_plan": plan,
         "unavailable_tickers": dropped,
+        "unavailable_companies": confirmed,
         "unavailable_years": dropped_years,
     }
 
@@ -589,6 +659,7 @@ async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> 
                 unavailable_tickers=state["unavailable_tickers"],
                 unavailable_years=state["unavailable_years"],
                 dropped_for_capacity=state["dropped_for_capacity"],
+                unavailable_companies=state["unavailable_companies"],
             ),
         ),
     ]

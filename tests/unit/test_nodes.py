@@ -12,9 +12,11 @@ defaulted, so ``Runtime(context=ctx)`` is the minimal standalone shim.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator
+import logging
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from typing import Any, cast
 
+import pytest
 from asyncpg import Pool
 from langchain_groq import ChatGroq
 from langgraph.runtime import Runtime
@@ -30,6 +32,7 @@ from alphalens.agent.nodes import (
     rerank_node,
     split_concatenated_years,
     synthesize_node,
+    validate_companies,
     validate_tickers,
     validate_years,
 )
@@ -108,12 +111,28 @@ class _FakeReranker:
 
 _ALLOWED = frozenset({"AAPL", "MSFT", "GOOGL"})
 
+# The REAL production roster shape: values are LEGAL names, mirroring scripts/seed_companies.py.
+# The company rail is meaningless against a ticker-valued roster, so it is tested against this.
+_SEED_ROSTER: Mapping[str, str] = {
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corporation",
+    "GOOGL": "Alphabet Inc.",
+    "AMZN": "Amazon.com Inc.",
+    "NVDA": "NVIDIA Corporation",
+    "META": "Meta Platforms Inc.",
+    "TSLA": "Tesla Inc.",
+    "BRK-B": "Berkshire Hathaway Inc.",
+    "JPM": "JPMorgan Chase & Co.",
+    "V": "Visa Inc.",
+}
+
 
 def _ctx(
     *,
     llm: Any = None,
     reranker: Any = None,
     allowed: frozenset[str] = _ALLOWED,
+    roster: Mapping[str, str] | None = None,
     breaker: SynthesisCircuitBreaker | None = None,
     embedder: Any = None,
     corpus_min_year: int = 2021,
@@ -131,7 +150,9 @@ def _ctx(
         else SynthesisCircuitBreaker(failure_threshold=3, reset_timeout_seconds=30.0),
         # retrieve_node is exercised in test_retrieve_node.py; a stand-in suffices here.
         embedder=cast(EmbeddingClient, embedder if embedder is not None else object()),
-        ticker_roster={t: t for t in allowed},  # S16: roster keys mirror the allowlist
+        # S16: roster keys mirror the allowlist. Values are TICKERS here, not legal names --
+        # company-rail tests pass an explicit legal-name roster instead (see _SEED_ROSTER).
+        ticker_roster=roster if roster is not None else {t: t for t in allowed},
         # Plan year-rail bounds: injected here (not read from env) so the rail's tests are
         # independent of the deployed corpus window.
         corpus_min_year=corpus_min_year,
@@ -154,13 +175,16 @@ def _chunk(chunk_id: str, ticker: str, year: int, text: str = "evidence") -> Ret
     )
 
 
-def _plan(tickers: list[str], years: list[int]) -> QueryPlan:
+def _plan(
+    tickers: list[str], years: list[int], unresolved_companies: list[str] | None = None
+) -> QueryPlan:
     return QueryPlan(
         tickers=tickers,
         intent="factual",
         time_range=TimeRange(years=years),
         sub_questions=["q"],
         entities=[],
+        unresolved_companies=unresolved_companies or [],
     )
 
 
@@ -171,6 +195,7 @@ def _state(**overrides: Any) -> AgentState:
         "user_id": None,
         "query_plan": _plan(["AAPL"], [2023]),
         "unavailable_tickers": [],
+        "unavailable_companies": [],
         "unavailable_years": [],
         "query": "How did AAPL revenue trend?",
         "iteration": 0,
@@ -195,6 +220,63 @@ def test_validate_tickers_split() -> None:
     kept, dropped = validate_tickers(["AAPL", "TSLA", "MSFT"], _ALLOWED)
     assert kept == ["AAPL", "MSFT"]
     assert dropped == ["TSLA"]
+
+
+def test_validate_companies_confirms_out_of_corpus() -> None:
+    # The S5b case: a genuinely absent company must survive the gate and reach the disclosure.
+    confirmed, false_pos = validate_companies(["Coca-Cola"], _SEED_ROSTER)
+    assert confirmed == ["Coca-Cola"]
+    assert false_pos == []
+
+
+def test_validate_companies_catches_legal_suffix_variance() -> None:
+    # The one class this gate closes: the model writes the user's wording, the roster holds the
+    # legal name. "Apple" must NOT be reported as out-of-corpus.
+    confirmed, false_pos = validate_companies(["Apple"], {"AAPL": "Apple Inc."})
+    assert confirmed == []
+    assert false_pos == ["Apple"]
+
+
+def test_validate_companies_is_casefolded() -> None:
+    confirmed, false_pos = validate_companies(["apple", "APPLE"], _SEED_ROSTER)
+    assert confirmed == []
+    assert false_pos == ["apple", "APPLE"]
+
+
+def test_validate_companies_short_needle_guard() -> None:
+    # _MIN_COMPANY_PREFIX: "V" must not prefix-match "Visa Inc.". Below the threshold the
+    # comparison degrades to exact equality, so the name flows through as confirmed.
+    confirmed, false_pos = validate_companies(["V"], _SEED_ROSTER)
+    assert confirmed == ["V"]
+    assert false_pos == []
+
+
+def test_validate_companies_residual_semantic_alias() -> None:
+    # RESIDUAL (deferred to the v2 alias table), asserted as-is -- NOT a fix.
+    # Under-match -> false CONFIRM: GOOGL is in the corpus, but "Google" does not match
+    # "Alphabet Inc.", so the footer would deny a company the body can cite.
+    confirmed, false_pos = validate_companies(["Google"], _SEED_ROSTER)
+    assert confirmed == ["Google"]
+    assert false_pos == []
+
+
+def test_validate_companies_residual_punctuation_whitespace() -> None:
+    # RESIDUAL (deferred to the v2 alias table), asserted as-is -- NOT a fix.
+    # Under-match -> false CONFIRM: casefold() normalizes case only, and startswith is
+    # left-anchored, so "jp morgan" diverges from "jpmorgan chase & co." at index 2.
+    confirmed, false_pos = validate_companies(["JP Morgan"], _SEED_ROSTER)
+    assert confirmed == ["JP Morgan"]
+    assert false_pos == []
+
+
+def test_validate_companies_residual_prefix_over_match() -> None:
+    # RESIDUAL (deferred to the v2 alias table), asserted as-is -- NOT a fix.
+    # Over-match -> false SUPPRESS, the OPPOSITE direction and the more dangerous one: a
+    # non-roster company named "Alpha" prefix-matches "Alphabet Inc.", so it is discarded and
+    # the user never sees the disclosure. That is the S5b silent drop, via this very gate.
+    confirmed, false_pos = validate_companies(["Alpha"], _SEED_ROSTER)
+    assert confirmed == []
+    assert false_pos == ["Alpha"]
 
 
 def test_split_concatenated_years_repairs_pair() -> None:
@@ -270,12 +352,51 @@ async def test_plan_node_drops_unavailable() -> None:
     out = await plan_node(_state(), _runtime(ctx))
 
     # partial update only
-    assert set(out.keys()) == {"query_plan", "unavailable_tickers", "unavailable_years"}
+    assert set(out.keys()) == {
+        "query_plan",
+        "unavailable_tickers",
+        "unavailable_companies",
+        "unavailable_years",
+    }
     assert out["query_plan"].tickers == ["AAPL"]  # dropped TSLA
     assert all(t in _ALLOWED for t in out["query_plan"].tickers)
     assert out["unavailable_tickers"] == ["TSLA"]
     # D3/D4: strict json_schema constrained decoding requested.
     assert llm.with_structured_output_kwargs == {"method": "json_schema", "strict": True}
+
+
+async def test_plan_node_surfaces_unresolved_companies() -> None:
+    # The path that actually matters: a company the model could not resolve reaches the state
+    # key Synthesize reads, by NAME ("Coca-Cola") -- not as a ticker, and not silently dropped.
+    llm = _FakeLLM(structured_result=_plan(["AAPL"], [2024], ["Coca-Cola"]))
+    out = await plan_node(_state(), _runtime(_ctx(llm=llm, roster=_SEED_ROSTER)))
+
+    assert out["unavailable_companies"] == ["Coca-Cola"]
+    assert out["query_plan"].unresolved_companies == ["Coca-Cola"]
+    assert out["query_plan"].tickers == ["AAPL"]  # the resolvable half is untouched
+
+
+async def test_plan_node_always_returns_unavailable_companies_key() -> None:
+    # Required TypedDict key: present on EVERY return path, [] when there is nothing to report.
+    llm = _FakeLLM(structured_result=_plan(["AAPL"], [2024]))
+    out = await plan_node(_state(), _runtime(_ctx(llm=llm, roster=_SEED_ROSTER)))
+
+    assert out["unavailable_companies"] == []
+
+
+async def test_plan_node_discards_false_positive_companies(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The model contradicts itself: it lists an IN-roster company as unresolved. Filter and
+    # log -- never promote into tickers, which would invent a retrieval cell nobody asked for.
+    llm = _FakeLLM(structured_result=_plan([], [2024], ["Apple"]))
+    with caplog.at_level(logging.WARNING, logger="alphalens.agent.nodes"):
+        out = await plan_node(_state(), _runtime(_ctx(llm=llm, roster=_SEED_ROSTER)))
+
+    assert out["unavailable_companies"] == []  # discarded, not disclosed
+    assert out["query_plan"].tickers == []  # and NOT promoted
+    assert "Apple" in caplog.text
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
 async def test_plan_node_drops_malformed_year() -> None:

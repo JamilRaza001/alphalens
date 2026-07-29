@@ -80,6 +80,18 @@ class QueryPlan(BaseModel):
     entities: list[str] = Field(
         description="Salient non-ticker entities (people, products, segments, metrics) named in the query."
     )
+    # REQUIRED with no default, deliberately: a default_factory drops the field from the
+    # generated json_schema's `required` array, and nothing else enforces it -- langchain-groq
+    # discards `strict=True` and emits no `additionalProperties: false`. A field the model may
+    # legally omit is precisely the silent-drop failure this rail exists to fix.
+    unresolved_companies: list[str] = Field(
+        description=(
+            "Companies named in the question that do NOT appear in the roster, verbatim as "
+            'the user wrote them (e.g. "Coca-Cola", not a guessed ticker). Every company '
+            "the question names belongs in EXACTLY ONE of `tickers` (in the roster) or this "
+            "field (not in the roster) -- never both, never neither."
+        )
+    )
 
 
 class EvalVerdict(BaseModel):
@@ -151,6 +163,12 @@ class AgentState(TypedDict):
     # are in-corpus (ticker, year) cells that retrieval MISSED (post-rerank).
     # No reducer -- replaced. Surfaced by Synthesize's honesty-rail.
     unavailable_tickers: list[str]
+    # Company NAMES the Plan LLM itself declared absent from the roster, kept verbatim as the
+    # user wrote them ("Coca-Cola", not "KO") so Synthesize can name what was asked for.
+    # Distinct in PROVENANCE from unavailable_tickers, which holds SYMBOLS the LLM emitted
+    # that failed the allowlist gate. Written once by plan_node, read by synthesize_node.
+    # No reducer -- replaced.
+    unavailable_companies: list[str]
     # Requested years dropped by the Plan year-rail because they are not plausible corpus
     # years -- e.g. the LLM concatenating "2023 vs 2024" into 20232024. Pre-retrieval, the
     # exact twin of unavailable_tickers; distinct from coverage_gaps, which are in-corpus
