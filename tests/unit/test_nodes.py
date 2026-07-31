@@ -24,6 +24,7 @@ from sentence_transformers import CrossEncoder
 
 from alphalens.agent.circuit_breaker import SynthesisCircuitBreaker
 from alphalens.agent.nodes import (
+    LOW_CONFIDENCE_CAVEAT,
     AgentContext,
     compute_coverage_gaps,
     evaluate_node,
@@ -639,3 +640,33 @@ async def test_synthesize_node_citations_and_stream() -> None:
     assert isinstance(stream, AsyncGenerator)
     pieces = [p async for p in stream]
     assert pieces == ["Hello", " world"]
+
+
+async def test_synthesize_node_low_confidence_emits_caveat_first() -> None:
+    """S_CR Phase 4: the caveat is code-emitted, so it is the FIRST token, every run."""
+    ctx = _ctx(llm=_FakeLLM())
+    state = _state(
+        reranked_chunks=[ScoredChunk(chunk=_chunk("c1", "AAPL", 2023), rerank_score=1.0)],
+        confidence="low",
+    )
+    out = await synthesize_node(state, _runtime(ctx))
+
+    pieces = [p async for p in out["answer_stream"]]
+    assert pieces[0] == LOW_CONFIDENCE_CAVEAT
+    # The LLM stream is delegated to untouched after the caveat.
+    assert pieces[1:] == ["Hello", " world"]
+
+
+async def test_synthesize_node_high_confidence_adds_nothing() -> None:
+    """confidence="high" -> the wrapper is not applied at all; stream is byte-identical."""
+    ctx = _ctx(llm=_FakeLLM())
+    state = _state(
+        reranked_chunks=[ScoredChunk(chunk=_chunk("c1", "AAPL", 2023), rerank_score=1.0)],
+        confidence="high",
+    )
+    out = await synthesize_node(state, _runtime(ctx))
+
+    text = "".join([p async for p in out["answer_stream"]])
+    assert LOW_CONFIDENCE_CAVEAT not in text
+    assert "confidence in this answer is low" not in text
+    assert text == "Hello world"

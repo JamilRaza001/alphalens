@@ -26,7 +26,12 @@ from alphalens.agent.circuit_breaker import (
     SynthesisCircuitBreaker,
     is_hard_failure,
 )
-from alphalens.agent.nodes import AgentContext, degraded_stream, synthesize_node
+from alphalens.agent.nodes import (
+    LOW_CONFIDENCE_CAVEAT,
+    AgentContext,
+    degraded_stream,
+    synthesize_node,
+)
 from alphalens.agent.state import AgentState, RetrievedChunk, ScoredChunk
 from alphalens.etl.embeddings import EmbeddingClient
 
@@ -415,3 +420,73 @@ async def test_synthesize_node_routes_open_breaker_to_degraded() -> None:
     assert "[AAPL 10-K 2023 · Item 7]" in text
     # One citation per reranked chunk regardless of degraded mode.
     assert [c.chunk_id for c in out["citations"]] == ["c1"]
+
+
+async def test_open_breaker_low_confidence_keeps_caveat_before_degraded() -> None:
+    """S_CR Phase 4 x S14: the two honesty rails compose.
+
+    OPEN breaker means no LLM runs at all, so a prompt-directive caveat could never have
+    fired here. The code-emitted caveat must still lead, followed by the degraded preamble --
+    and the breaker's gate must still be evaluated lazily at drain (G3), not at node return.
+    """
+
+    class _NoStreamLLM:
+        def astream(self, messages: Any) -> AsyncGenerator[Any, None]:
+            raise AssertionError("LLM must not be streamed while the breaker is OPEN")
+
+    breaker = _breaker(threshold=1, reset=30.0)
+    breaker._record_hard_failure()  # noqa: SLF001 -- trip directly (threshold 1) for the test
+    assert breaker.state is BreakerState.OPEN
+
+    ctx = AgentContext(
+        llm=cast(ChatGroq, _NoStreamLLM()),
+        reranker=cast(CrossEncoder, object()),
+        pool=cast(Pool, object()),
+        allowed_tickers=frozenset({"AAPL"}),
+        breaker=breaker,
+        embedder=cast(EmbeddingClient, object()),
+        ticker_roster={},
+        corpus_min_year=2021,
+        corpus_max_year=2026,
+    )
+    reranked = [
+        ScoredChunk(
+            chunk=RetrievedChunk(
+                chunk_id="c1",
+                text="Cash flow was strong.",
+                section="Item 7",
+                ticker="AAPL",
+                period_year=2023,
+                filing_type="10-K",
+            ),
+            rerank_score=1.0,
+        )
+    ]
+    state: AgentState = cast(
+        AgentState,
+        {
+            "original_query": "q",
+            "request_id": "r",
+            "user_id": None,
+            "query_plan": None,
+            "unavailable_tickers": [],
+            "unavailable_companies": [],
+            "unavailable_years": [],
+            "query": "q",
+            "iteration": 0,
+            "retrieved_chunks": [],
+            "reranked_chunks": reranked,
+            "dropped_for_capacity": [],
+            "confidence": "low",
+            "confidence_reason": "llm",
+            "coverage_gaps": [],
+            "citations": [],
+            "answer_stream": None,
+        },
+    )
+    out = await synthesize_node(state, Runtime(context=ctx))
+    pieces = [tok async for tok in out["answer_stream"]]
+
+    assert pieces[0] == LOW_CONFIDENCE_CAVEAT  # caveat leads
+    assert "temporarily unavailable" in pieces[1]  # degraded preamble follows it
+    assert "Cash flow was strong." in "".join(pieces)  # evidence still surfaced

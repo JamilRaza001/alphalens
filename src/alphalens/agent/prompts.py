@@ -138,8 +138,6 @@ Rules:
 - Cite the passage(s) supporting each claim with inline markers like [1], [2] that refer to \
 the numbered passages.
 - If a passage does not support a needed fact, say so plainly rather than guessing.
-- If the confidence flag is "low", open with a one-line caveat that the answer may be \
-incomplete or unsupported by the retrieved evidence.
 - If any requested companies are unavailable (not in the corpus), state explicitly that they \
 are outside AlphaLens's coverage and were not analyzed. Keep this distinct from evidence that \
 was simply not retrieved.
@@ -158,16 +156,19 @@ Write a clear, concise analyst answer."""
 def build_synthesize_user_msg(
     query: str,
     reranked: list[ScoredChunk],
-    confidence: str,
     unavailable_tickers: list[str],
     unavailable_years: list[int],
     dropped_for_capacity: list[tuple[str, int]],
     unavailable_companies: list[str],
 ) -> str:
-    """Assemble the human turn: question, evidence, confidence flag, the unavailable-ticker /
-    unavailable-company / unavailable-year notes (all worded distinctly from coverage gaps),
-    and -- only when non-empty -- the capacity-dropped (ticker, year) pairs (S17 honesty rail;
-    emitted as nothing on normal queries to avoid disclosure noise).
+    """Assemble the human turn: question, evidence, the unavailable-ticker / unavailable-company
+    / unavailable-year notes (all worded distinctly from coverage gaps), and -- only when
+    non-empty -- the capacity-dropped (ticker, year) pairs (S17 honesty rail; emitted as nothing
+    on normal queries to avoid disclosure noise).
+
+    Carries NO confidence flag: the low-confidence caveat is emitted deterministically by
+    `_prepend_caveat` in nodes.py (S_CR Phase 4), not requested from the model here. Phase 3
+    measured the old prompt directive binding on only 1 of 3 fixed-input runs.
 
     The company note carries NAMES the Plan LLM could not resolve to the roster at all
     ("Coca-Cola"); the ticker note carries SYMBOLS it emitted that failed the allowlist gate
@@ -186,7 +187,6 @@ def build_synthesize_user_msg(
         )
     return (
         f"User question:\n{query}\n\n"
-        f"Confidence flag: {confidence}\n"
         f"Unavailable (out-of-corpus) tickers: {unavailable}\n"
         f"Unavailable (out-of-corpus) companies: {bad_companies}\n"
         f"Unavailable (out-of-coverage) years: {bad_years}\n"

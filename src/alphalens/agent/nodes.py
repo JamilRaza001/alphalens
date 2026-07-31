@@ -636,6 +636,27 @@ async def evaluate_node(state: AgentState, runtime: Runtime[AgentContext]) -> di
     }
 
 
+# Deterministic low-confidence caveat (S_CR Phase 4). Carries NO retrieval-attempt language
+# ("were retrieved", "could not be found") -- that phrasing is the AC7a defect surface, since
+# it implies a retry would help when the corpus simply has no such evidence.
+LOW_CONFIDENCE_CAVEAT = "Note: confidence in this answer is low; it may be incomplete.\n\n"
+
+
+async def _prepend_caveat(
+    caveat: str, inner: AsyncGenerator[str, None]
+) -> AsyncGenerator[str, None]:
+    """Yield `caveat`, then delegate to `inner` unchanged.
+
+    Deliberately wraps OUTSIDE `breaker.stream(...)`: `inner` is a created-but-unstarted async
+    generator, so the breaker's gate still evaluates lazily on `inner`'s first `__anext__`
+    (S14 G3) -- after this caveat token, never at node-return time. Do not "simplify" this by
+    checking breaker state or draining `inner` here.
+    """
+    yield caveat
+    async for token in inner:
+        yield token
+
+
 # ── Node 5: Synthesize -- Groq stream + citations + honesty-rail ──────────────
 async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> dict[str, Any]:
     citations = [
@@ -655,7 +676,6 @@ async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> 
             build_synthesize_user_msg(
                 query=state["query"],
                 reranked=state["reranked_chunks"],
-                confidence=state["confidence"],
                 unavailable_tickers=state["unavailable_tickers"],
                 unavailable_years=state["unavailable_years"],
                 dropped_for_capacity=state["dropped_for_capacity"],
@@ -674,7 +694,14 @@ async def synthesize_node(state: AgentState, runtime: Runtime[AgentContext]) -> 
         return degraded_stream(state["reranked_chunks"])
 
     # S14: route synthesis through the circuit breaker (OPEN -> serve `fallback`).
-    return {"answer_stream": ctx.breaker.stream(protected, fallback), "citations": citations}
+    stream = ctx.breaker.stream(protected, fallback)
+
+    # S_CR Phase 4: the low-confidence caveat is emitted by CODE, not asked of the model.
+    # Measured in Phase 3, the prompt directive bound on only 1 of 3 fixed-input runs.
+    if state["confidence"] == "low":
+        stream = _prepend_caveat(LOW_CONFIDENCE_CAVEAT, stream)
+
+    return {"answer_stream": stream, "citations": citations}
 
 
 # ── Groq streaming seam -- S14 circuit-breaker wraps this function ────────────

@@ -17,7 +17,6 @@ def _msg(
     return build_synthesize_user_msg(
         query="q",
         reranked=[],
-        confidence="high",
         unavailable_tickers=unavailable_tickers or [],
         unavailable_years=[],
         dropped_for_capacity=[],
@@ -41,6 +40,13 @@ def test_synthesize_msg_companies_line_distinct_from_tickers_line() -> None:
     msg = _msg(unavailable_tickers=["KO"], unavailable_companies=["Coca-Cola"])
     assert "Unavailable (out-of-corpus) tickers: KO" in msg
     assert "Unavailable (out-of-corpus) companies: Coca-Cola" in msg
+
+
+def test_synthesize_msg_carries_no_confidence_flag() -> None:
+    # S_CR Phase 4: the confidence flag left the prompt entirely -- the caveat is now emitted
+    # deterministically in nodes.py. A reappearing flag line means the rail regressed to a
+    # prompt directive, which Phase 3 measured binding on only 1 of 3 fixed-input runs.
+    assert "Confidence flag" not in _msg()
 
 
 def test_plan_system_prompt_renders_roster_and_example_block() -> None:
