@@ -782,27 +782,40 @@ Numbered list. Each item is concrete and testable.
 | 11 | `11_circuit_breaker.md` — Groq circuit breaker | 10 | |
 | 12 | `12_retrieval.md` — hybrid search (HNSW + tsvector) + RRF fusion + metadata filters | 02, 06 | |
 
-#### Phase 1.C — Deployment (specs 13–17)
+#### Phase 1.C — Deployment (specs 13–17b)
 
 | Spec | Title | Depends on | Notes |
 |---|---|---|---|
-| 13 | `13_lambda_dockerfile.md` — single Dockerfile (agent + reranker merged) | 1.A + 1.B complete | One container, not two |
-| 14 | `14_lambda_deployment.md` — Function URL auth=NONE, Vercel OIDC middleware, IAM, ECR push | 13 | |
-| 15 | `15_r2_setup.md` — bucket lifecycle + IAM policy | — | |
-| 16 | `16_observability.md` — Opik + Sentry + CloudWatch wiring | 14 | |
-| 17 | `17_frontend.md` — Next.js + Vercel + SSE consumption + OIDC token injection | 14 | |
+| 13 | `13_lambda_dockerfile.md` — single Dockerfile (agent + reranker merged) | 1.A + 1.B complete | **v1** — build only, no ECR push. Validates image size |
+| 14 | `14_lambda_deployment.md` — Function URL auth=NONE, Vercel OIDC middleware, IAM, ECR push | 13 | **v2 (end)** |
+| 15 | `15_r2_setup.md` — bucket lifecycle + IAM policy | — | **v1** |
+| 16 | `16_observability.md` — Opik + Sentry + CloudWatch wiring | 14 | **v2 (end)** |
+| 17a | `17a_frontend_local.md` — Next.js + SSE consumption, local dev only | 1.B complete | **v1** |
+| 17b | `17b_frontend_deploy.md` — Vercel deploy + OIDC token injection | 14, 17a | **v2 (end)** |
 
-**Total: 17 specs** (was 18 — XBRL removed from Phase 1)
+**Total: 18 specs** (17 was pre-split; spec 17 is now 17a/17b. XBRL removed from Phase 1.)
+**v1 scope: 01–13, 15, 17a. Deferred to v2 (end): 14, 16, 17b.**
 
-### 13.4 Definition of Done — Phase 2
+### 13.4 Definition of Done — v1
 
-- All 17 specs authored, reviewed, committed
+- All v1-scoped specs authored, reviewed, committed (see scope tags, §13.3)
 - All implementations pass per-spec acceptance criteria
-- ETL pipeline ingests all ~200 filings end-to-end with status='processed' for ≥95%
-- Agent answers 10 sample queries from golden dataset with citations
-- E2E latency on warm Lambda ≤15s for 95th percentile
+- ETL pipeline ingests all ~200 filings end-to-end with status='processed' for >=95%
+- Agent answers 10 sample queries from the golden dataset with citations **where the corpus supports an answer**. Where it does not, the response is an honest coverage/evidence disclosure with no fabricated figures. Answer-correctness on tabular financials is gated on the v2 iXBRL/chunking fix. Evidence: an S_company_honesty_rail Phase 3 pass (31 Jul 2026) requested four (company, metric) cells and missed all four, every run returning confidence=low.
+- Local frontend runs against the local agent and streams a full answer end-to-end
+
+### 13.4a Deferred to end of v2 (was §13.4)
+
+- E2E latency on warm Lambda <=15s for 95th percentile
 - Deployed to production (Lambda + Vercel), Function URL accessible, frontend loads
 - All observability integrations show data (Opik traces, Sentry events, CloudWatch logs)
+
+> **Amendment (31 Jul 2026).** Deployment, hosted frontend, and observability moved to the end of v2.
+> Reason: finding F1 — the agent currently returns zero successful financial answers (4/4 cells missed);
+> suspected root cause is iXBRL ETL/chunking (v2 priority #1). Deploying a system whose every answer is
+> "cannot determine" returns nothing. Spec 13 stays in v1 as cheap insurance: it validates container image
+> size with no AWS call. Known cost of this deferral: Lambda cold-start, container-size, and p95 risks are
+> discovered later rather than now, and the AWS credits carry a 6-month expiry.
 
 ---
 
