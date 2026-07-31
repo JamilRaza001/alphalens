@@ -5,7 +5,7 @@
 - **Compute:** AWS Lambda Container (FastAPI + LangGraph 5-node + Lambda Web Adapter) — ap-southeast-1
 - **Database:** Neon Postgres + pgvector (HNSW `VECTOR(768)` + tsvector GIN)
 - **Storage:** Cloudflare R2 (filings cache, $0 egress, 10 GB free)
-- **LLM:** Groq LLaMA 3.3 70B Versatile
+- **LLM:** Groq `openai/gpt-oss-120b` (env `GROQ_MODEL`; Plan/Evaluate pin `temperature=0`, Synthesize uses `GROQ_TEMPERATURE`)
 - **Embeddings:** Jina v3 primary (`truncate_dim=768`) + nomic-embed-text-v1.5 fallback; ms-marco-MiniLM-L-6-v2 reranker (in-process)
 
 ## Key Pointers
