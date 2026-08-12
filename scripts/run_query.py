@@ -61,13 +61,21 @@ async def run_query(question: str, *, user_id: str | None = None) -> None:
         for c in final_state["citations"]:
             print(f"  [{c.ticker} {c.filing_type} {c.period_year}] {c.section} ({c.chunk_id})")
 
+        # query_plan is the sole home of the resolved tickers (D2). An early exit can leave it
+        # unset, so read it defensively -- the footer must print rather than KeyError on the
+        # way out of a failed run.
+        plan = final_state.get("query_plan")
+        plan_tickers = plan.tickers if plan is not None else None
+
         print(
             f"\nconfidence={final_state['confidence']} "
             f"reason={final_state['confidence_reason']} "
             f"coverage_gaps={final_state['coverage_gaps']} "
             f"capacity_drops={final_state['capacity_drops']} "
-            f"unavailable={final_state['unavailable_tickers']} "
+            f"unavailable_tickers={final_state['unavailable_tickers']} "
             f"unavailable_years={final_state['unavailable_years']} "
+            f"unavailable_companies={final_state['unavailable_companies']} "
+            f"plan_tickers={plan_tickers} "
             f"latency={time.monotonic() - t0:.2f}s"
         )
     finally:
