@@ -817,6 +817,8 @@ Numbered list. Each item is concrete and testable.
 > size with no AWS call. Known cost of this deferral: Lambda cold-start, container-size, and p95 risks are
 > discovered later rather than now, and the AWS credits carry a 6-month expiry.
 
+> **Amendment (12 Aug 2026) — supersedes the Spec 13 carve-out above.** The Lambda Dockerfile (spec 13) is moved to the v2 deployment backlog. Reason: recon on 12 Aug 2026 confirmed `src/alphalens/api/` contains only an empty `__init__.py` — no FastAPI/SSE application exists yet, so the "cheap insurance" rationale above has nothing to validate against. A new v1 spec **S18 (FastAPI + SSE local app, no auth/OIDC)** is inserted ahead of the local frontend, which is renumbered **S19** (was "spec 17a"). Root cause of the gap: the SSE endpoint was originally scoped inside spec 14, and the 31 Jul deferral moved spec 14 as one block without splitting the local-app concern from the Lambda-deployment concern. Revised v1 scope: **01–12, 15, S18, S19.** Specs 13, 14, 16, 17b are v2.
+
 ---
 
 ## 14. Version Roadmap
