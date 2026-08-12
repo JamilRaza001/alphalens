@@ -786,15 +786,17 @@ Numbered list. Each item is concrete and testable.
 
 | Spec | Title | Depends on | Notes |
 |---|---|---|---|
-| 13 | `13_lambda_dockerfile.md` — single Dockerfile (agent + reranker merged) | 1.A + 1.B complete | **v1** — build only, no ECR push. Validates image size |
+| S18 | `S18_fastapi_sse_local.md` — FastAPI + SSE local app (no auth/OIDC) | 1.B complete | **v1** — added 12 Aug 2026 amendment. Prerequisite for S19 |
+| 13 | `13_lambda_dockerfile.md` — single Dockerfile (agent + reranker merged) | 1.A + 1.B complete | **v1 → v2** per 12 Aug 2026 amendment (§13.4a). Was: build only, no ECR push, validates image size |
 | 14 | `14_lambda_deployment.md` — Function URL auth=NONE, Vercel OIDC middleware, IAM, ECR push | 13 | **v2 (end)** |
 | 15 | `15_r2_setup.md` — bucket lifecycle + IAM policy | — | **v1** |
 | 16 | `16_observability.md` — Opik + Sentry + CloudWatch wiring | 14 | **v2 (end)** |
-| 17a | `17a_frontend_local.md` — Next.js + SSE consumption, local dev only | 1.B complete | **v1** |
+| 17a | `17a_frontend_local.md` — Next.js + SSE consumption, local dev only | 1.B complete | **v1** — renumbered **S19** per 12 Aug 2026 amendment |
+| S19 | local frontend (Next.js + SSE) — renumber of 17a | S18 | **v1** |
 | 17b | `17b_frontend_deploy.md` — Vercel deploy + OIDC token injection | 14, 17a | **v2 (end)** |
 
 **Total: 18 specs** (17 was pre-split; spec 17 is now 17a/17b. XBRL removed from Phase 1.)
-**v1 scope: 01–13, 15, 17a. Deferred to v2 (end): 14, 16, 17b.**
+**v1 scope: 01–12, 15, S18, S19** *(revised 12 Aug 2026; was: 01–13, 15, 17a).* **Deferred to v2 (end): 13, 14, 16, 17b.**
 
 ### 13.4 Definition of Done — v1
 
