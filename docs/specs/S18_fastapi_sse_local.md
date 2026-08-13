@@ -37,19 +37,19 @@
    single event. It is split so that some of it lands **before** any answer token and the rest lands
    **after** the last one: a `meta` event first, then a `citations` event once the prose is complete.
    *(Phrasing corrected 13 Aug 2026 — this was written as "two-phase metadata" when `done` carried no
-   metadata of its own. `DoneEvent` now carries `latency_s` / `token_count` / `degraded`, so the count
+   metadata of its own. `DoneEvent` now carries `latency_s` / `token_count` / `breaker_open`, so the count
    of metadata-bearing events is no longer two. The locked decision is unchanged: **metadata before the
    answer AND after it**, never one lump at the end.)*
    **Known limitation, accepted:** because of D3, `meta` is emitted when `ainvoke` *returns* — i.e. after
    the whole graph has run — **not** when the Plan node finishes. The user therefore sees
    `unavailable_companies` before the prose starts, but not at ~2s. Emitting it at plan-time would
    require breaking S16 D2; that is **out of scope here and not scheduled**.
-   **Amended 13 Aug 2026 (Q1):** degraded-ness is NOT part of the pre-answer metadata. It is not
+   **Amended 13 Aug 2026 (Q1):** breaker state is NOT part of the pre-answer metadata. It is not
    knowable at `meta` time — S14's breaker gate fires lazily on the first `__anext__` of the answer
    stream (`circuit_breaker.py:125`), which under D3 happens strictly after `meta` is emitted. A
    breaker that reads CLOSED at `meta` time can still hard-fail at connect and serve the degraded
    fallback, so any `meta`-time flag would be a claim the run has not yet earned. It moves to
-   `DoneEvent.degraded`, read from the breaker **after** the drain completes.
+   `DoneEvent.breaker_open` (N2), read from the breaker **after** the drain completes.
 
 5. **D5 — `POST /query`, SSE response body; browser `EventSource` is NOT usable.** The native
    `EventSource` API is GET-only and cannot send a request body. Putting a free-text financial question
@@ -175,7 +175,10 @@ class DoneEvent(BaseModel):
 
     latency_s: float
     token_count: int
-    degraded: bool        # breaker OPEN — resolved AFTER drain, not at meta time (Q1)
+    # Breaker state at terminal time, resolved AFTER the drain — not at meta time (Q1). This
+    # reports what the BREAKER was, NOT whether fallback content was served (N2); see the
+    # CLOSED-boundary entry in Out of Scope.
+    breaker_open: bool
 
 
 class ErrorEvent(BaseModel):
@@ -184,7 +187,10 @@ class ErrorEvent(BaseModel):
 
     message: str          # operator-safe summary; NEVER a raw traceback or DB URL
     phase: str            # "graph" | "stream"
-    degraded: bool        # N1: `error` is terminal and `done` never fires — the breaker signal rides here
+    # N1: `error` is terminal and `done` never fires — the breaker signal rides here. Same
+    # contract as DoneEvent.breaker_open: breaker state at terminal time, NOT a claim that
+    # fallback content was served (N2).
+    breaker_open: bool
 
 
 # ── src/alphalens/api/app.py ── FastAPI wrapper · owns cold-start for the process ──
@@ -257,8 +263,10 @@ def main() -> None:
 
 6. **Degraded path streams.** With the breaker forced OPEN, the request still returns 200 with a
    well-formed event sequence, the degraded preamble arrives as `token` events, and the terminal
-   event carries **`DoneEvent.degraded is True`** — asserted there, **not** on `meta`, which cannot
-   know it (D4 amendment / Q1). **No LLM call is made** — pinned by a fake whose `astream` raises
+   event carries **`DoneEvent.breaker_open is True`** — asserted there, **not** on `meta`, which
+   cannot know it (D4 amendment / Q1). Note the assertion is on breaker state, not on "fallback was
+   served" (N2): with the breaker forced OPEN those coincide, which is precisely why this AC is
+   written against a forced-OPEN breaker. **No LLM call is made** — pinned by a fake whose `astream` raises
    `AssertionError` if touched. That fake already exists and is reusable: `_NoStreamLLM`
    (`tests/unit/test_circuit_breaker.py:363`, same guard shape as S_CR Phase 4). Force OPEN with the
    established pattern — `SynthesisCircuitBreaker(failure_threshold=1, …)` then
@@ -274,13 +282,13 @@ def main() -> None:
    graph failed to produce a stream at all, so the drain never began and there is nothing for
    `"stream"` to describe. No `token` events precede it.
 
-   **The terminal event always carries `degraded` (N1).** `done` and `error` are both terminal and
-   mutually exclusive — `error` does NOT get a trailing `done`, because that would break the
+   **The terminal event always carries `breaker_open` (N1/N2).** `done` and `error` are both terminal
+   and mutually exclusive — `error` does NOT get a trailing `done`, because that would break the
    terminal-event contract and give the client two endings to reconcile. So the breaker signal rides
-   on whichever one fires: `DoneEvent.degraded` on success, `ErrorEvent.degraded` on failure. A run
-   that degrades and then fails mid-drain must still report `degraded=True` — that combination is the
-   exact case this rule exists for. On the `phase="graph"` path the drain never ran, so the breaker
-   was never gated and `degraded` is `False`.
+   on whichever one fires: `DoneEvent.breaker_open` on success, `ErrorEvent.breaker_open` on failure.
+   A run whose breaker is OPEN and which then fails mid-drain must still report `breaker_open=True` —
+   that combination is the exact case this rule exists for. On the `phase="graph"` path the drain
+   never ran, so the breaker was never gated and the value reflects its untouched state.
 
 8. **Footer parity (INTERSECTION, amended 13 Aug 2026).** The **intersection** of `MetaEvent`'s
    fields and `run_query.py`'s footer keys carries **identical values for the same run**. Two
@@ -384,6 +392,13 @@ def main() -> None:
   near-identically-named capacity lists in front of S19 with no stated difference between them, and
   the footer does not print it. Revisit when a consumer actually needs the distinction between
   "trimmed by budget" and "flagged as budget-caused coverage miss".
+- **An exact "degraded content was served" signal** (N2). `breaker_open` reports breaker state, which
+  is not the same question: on the CLOSED-boundary path (`circuit_breaker.py:140-145`) a CLOSED
+  breaker hard-fails before the first token, serves `degraded_stream`, and records a failure that
+  leaves the streak below threshold — so the user reads raw excerpts while `breaker_open` reads
+  `False`. Documented, **not fixed**: an exact signal requires the breaker itself to report that it
+  served the fallback, which is a breaker change and therefore outside D1's wrap-only scope — **v2**,
+  alongside whichever spec owns that change.
 
 ---
 
@@ -397,7 +412,7 @@ ground truth; the spec has been corrected, not the code.
 
 | Field | Spec said | Live at HEAD | Resolution |
 |---|---|---|---|
-| `status` | `str`, `"ok" \| "degraded"` | **No such key** — and no degraded flag under any name. Degradation lives in `ctx.breaker.state` and is evaluated lazily at drain (`circuit_breaker.py:125`), which under D3 is strictly after `meta` | **Removed** from `MetaEvent`; moved to `DoneEvent.degraded: bool`, read after the drain (Q1) |
+| `status` | `str`, `"ok" \| "degraded"` | **No such key** — and no degraded flag under any name. Degradation lives in `ctx.breaker.state` and is evaluated lazily at drain (`circuit_breaker.py:125`), which under D3 is strictly after `meta` | **Removed** from `MetaEvent`; moved to the terminal event, read after the drain (Q1). Landed as `degraded: bool`, renamed to `breaker_open: bool` later the same day — see N2 |
 | `confidence_reason` | `"coverage" \| "capacity" \| "llm" \| "none"` | `Literal["coverage", "llm", "none"]` (`state.py:198`) — **no `"capacity"` member**; the fourth value was invented | Comment corrected to the live 3 (Q2) |
 | `coverage_gaps` | `list[str]` | `list[tuple[str, int]]` (`state.py:199`) | `list[GapCell]` — `{"ticker": …, "year": …}` (Q3) |
 | `capacity_drops` | `list[str]` | `list[tuple[str, int]]` (`state.py:204`) | `list[GapCell]`; key retained for footer parity, `dropped_for_capacity` stays off the wire (Q3/Q4) |
@@ -421,15 +436,46 @@ no dependency.
 
 ### Second pass (same day) — degraded-signal gap + the four remaining open questions
 
-Moving `degraded` off `meta` (Q1, above) opened a hole that the first pass did not close, found while
+Moving the breaker flag off `meta` (Q1, above) opened a hole that the first pass did not close, found while
 reconciling AC4's event sequence against AC7's error paths:
 
 - **N1 — the degraded signal could be lost entirely.** AC7 terminates a failed run with `error` and
-  **no** `done`, so once `degraded` lived only on `DoneEvent`, a run that degraded (breaker OPEN,
+  **no** `done`, so once the flag lived only on `DoneEvent`, a run that degraded (breaker OPEN,
   serving `degraded_stream`) and *then* failed mid-drain reported its degradation nowhere. The fix is
   **not** to emit `done` after `error` — two terminal events is a worse contract than a missing flag.
-  `ErrorEvent` gains `degraded: bool`, and the rule becomes: **the flag rides on whichever terminal
-  event fires.** See AC7.
+  `ErrorEvent` gains the flag too, and the rule becomes: **it rides on whichever terminal event
+  fires.** See AC7.
+
+- **N2 — the field is `breaker_open: bool`, not `degraded: bool`** (both events). The value is read
+  from breaker state, so it must claim exactly that and nothing more. `degraded` promises "the user
+  received fallback content", and that promise is false on the **CLOSED-boundary path**: at
+  `circuit_breaker.py:140-145` a CLOSED breaker can hard-fail before the first token, serve
+  `degraded_stream`, and record a failure that leaves the streak below threshold — fallback content
+  went out, breaker still reads CLOSED. This is the Q1 error shape at the other end: a field
+  asserting more than its source can support. `breaker_open` is always true to what it measures.
+  **The CLOSED-boundary gap is documented, not fixed** — see Out of Scope; it is deferred to v2
+  alongside a breaker change.
+
+  Two alternatives were considered and **rejected**, recorded so they are not revisited:
+  1. **Sentinel-match `degraded_stream`'s preamble** to detect fallback — couples the wire contract
+     to prompt/answer text. That is the exact drift class this project has been bitten by repeatedly
+     (`37e4b41`'s footer drift, the `【7】` marker instability).
+  2. **Change the breaker to expose "I served fallback"** — violates D1 (wrap-only: this spec does not
+     edit `circuit_breaker.py` or `nodes.py`) and needs its own spec.
+
+**Known test-strategy limitations — these are limits of the harness, not gaps in this spec:**
+
+- **AC1** cannot be honestly verified in-suite. The repo has a populated `.env` and `get_settings()` is
+  `lru_cache`d, so "imports with no `.env`" needs a subprocess with a scrubbed environment; the
+  in-suite version is a spy asserting `build_context` / `build_graph` are never called at import or in
+  `create_app()`. (The *code-level* claim is sound after Q6/Q7 removed the `get_settings()` call from
+  `create_app`.)
+- **AC10**'s real `http.disconnect` is delivered by the ASGI server and is not reachable through
+  Starlette's `TestClient`; the unit test covers our generator's own cleanup, and the true disconnect
+  is a manual `curl -N` + Ctrl-C check.
+- **G1 / G3** progressive delivery is manual by nature — `curl -N -X POST` against a live `run_api.py`,
+  confirming tokens arrive incrementally rather than in one lump. Record the observation; do not fake
+  it.
 
 The four questions the first pass left open are now closed:
 
@@ -441,5 +487,5 @@ The four questions the first pass left open are now closed:
 | Q12 | `request_id` provenance | **Server-side `uuid4()`**, mirroring run_query.py's intake (S16 G4). `QueryRequest` has no id field — a client-supplied id is a trace-poisoning surface and would break CLI/HTTP correspondence |
 
 Also corrected in this pass: **D4's heading and prose said "two-phase metadata"**, which stopped being
-accurate once `DoneEvent` grew `latency_s` / `token_count` / `degraded`. The locked decision is
+accurate once `DoneEvent` grew `latency_s` / `token_count` / `breaker_open`. The locked decision is
 unchanged — metadata before the answer *and* after it — only the phrasing was fixed.
