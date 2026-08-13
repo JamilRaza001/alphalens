@@ -795,7 +795,7 @@ Numbered list. Each item is concrete and testable.
 | S19 | local frontend (Next.js + SSE) — renumber of 17a | S18 | **v1** |
 | 17b | `17b_frontend_deploy.md` — Vercel deploy + OIDC token injection | 14, 17a | **v2 (end)** |
 
-**Total: 18 specs** (17 was pre-split; spec 17 is now 17a/17b. XBRL removed from Phase 1.)
+**Total: 19 specs** (was 18; S18 added 12 Aug 2026. Spec 17 was pre-split into 17a/17b, and 17a is renumbered S19 — a rename, not a new spec. XBRL removed from Phase 1.)
 **v1 scope: 01–12, 15, S18, S19** *(revised 12 Aug 2026; was: 01–13, 15, 17a).* **Deferred to v2 (end): 13, 14, 16, 17b.**
 
 ### 13.4 Definition of Done — v1

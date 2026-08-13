@@ -1694,7 +1694,7 @@ sudo usermod -aG docker $USER
 
 ### nomic-embed-text-v1.5 out of memory in Lambda
 - nomic needs ~1.5–2GB RAM. Lambda memory must be set to at minimum 3GB.
-- This is handled in spec 13 (Dockerfile) and spec 14 (Lambda config).
+- This is handled in spec 13 (Dockerfile) and spec 14 (Lambda config) — **both deferred to v2** per the 12 Aug 2026 amendment (v8 §13.4a). Not a v1 concern.
 
 ### uv.lock merge conflicts
 - Run `uv sync` after resolving — uv regenerates the lockfile from pyproject.toml automatically.
