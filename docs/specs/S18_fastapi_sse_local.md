@@ -33,14 +33,18 @@
    `custom` couples nodes to a stream writer and breaks S14's DI). The breaker gate still fires
    **lazily at drain time** — inside the SSE generator, not during `ainvoke`.
 
-4. **D4 — Two-phase metadata (LOCKED by Jamil, 12 Aug 2026).** The client receives metadata in **two**
-   events, not one: a `meta` event **before** any answer token, and a `citations` event **after** the
-   last one.
+4. **D4 — Metadata brackets the answer (LOCKED by Jamil, 12 Aug 2026).** Metadata does not arrive in a
+   single event. It is split so that some of it lands **before** any answer token and the rest lands
+   **after** the last one: a `meta` event first, then a `citations` event once the prose is complete.
+   *(Phrasing corrected 13 Aug 2026 — this was written as "two-phase metadata" when `done` carried no
+   metadata of its own. `DoneEvent` now carries `latency_s` / `token_count` / `degraded`, so the count
+   of metadata-bearing events is no longer two. The locked decision is unchanged: **metadata before the
+   answer AND after it**, never one lump at the end.)*
    **Known limitation, accepted:** because of D3, `meta` is emitted when `ainvoke` *returns* — i.e. after
    the whole graph has run — **not** when the Plan node finishes. The user therefore sees
    `unavailable_companies` before the prose starts, but not at ~2s. Emitting it at plan-time would
    require breaking S16 D2; that is **out of scope here and not scheduled**.
-   **Amended 13 Aug 2026 (Q1):** degraded-ness is NOT part of the two-phase metadata. It is not
+   **Amended 13 Aug 2026 (Q1):** degraded-ness is NOT part of the pre-answer metadata. It is not
    knowable at `meta` time — S14's breaker gate fires lazily on the first `__anext__` of the answer
    stream (`circuit_breaker.py:125`), which under D3 happens strictly after `meta` is emitted. A
    breaker that reads CLOSED at `meta` time can still hard-fail at connect and serve the degraded
@@ -103,7 +107,13 @@ from pydantic import BaseModel, Field
 
 
 class QueryRequest(BaseModel):
-    """Request body for POST /query."""
+    """Request body for POST /query.
+
+    Deliberately carries NO request/trace/correlation id field (Q12). `request_id` is generated
+    SERVER-side with `uuid4()`, mirroring run_query.py's intake (S16 G4) so the HTTP surface and
+    the CLI harness produce ids the same way. A client-supplied id is a trace-poisoning surface:
+    the caller could collide or forge ids and corrupt log correlation, and nothing downstream
+    validates it. `user_id` is a caller-supplied attribution field, not an id we trust for tracing."""
 
     question: str = Field(min_length=1, max_length=2000)
     user_id: str | None = None
@@ -154,7 +164,14 @@ class CitationOut(BaseModel):
 
 
 class DoneEvent(BaseModel):
-    """Payload of the terminal `done` event."""
+    """Payload of the terminal `done` event — fires only on a successful run (see ErrorEvent).
+
+    `token_count` is the number of `token` EVENTS this stream emitted (Q11) — i.e. how many
+    non-empty deltas `stream_synthesis` yielded, or how many chunks `degraded_stream` produced on
+    the degraded path. It is NOT a model-token count and NOT a billing figure: Groq's tokenizer
+    boundaries, this stream's `data:` frames, and any usage metering are three different things,
+    and one delta routinely spans several model tokens. Named `token_count` because it counts the
+    events literally named `token`."""
 
     latency_s: float
     token_count: int
@@ -167,6 +184,7 @@ class ErrorEvent(BaseModel):
 
     message: str          # operator-safe summary; NEVER a raw traceback or DB URL
     phase: str            # "graph" | "stream"
+    degraded: bool        # N1: `error` is terminal and `done` never fires — the breaker signal rides here
 
 
 # ── src/alphalens/api/app.py ── FastAPI wrapper · owns cold-start for the process ──
@@ -191,15 +209,22 @@ def create_app(cors_origins: list[str] | None = None) -> FastAPI:
     `cors_origins` is a PARAMETER, not a config read: `CORSMiddleware` must be registered at
     construction time, and reaching for `get_settings()` here would validate the whole
     environment inside `create_app()` — raising `ValidationError` with no `.env` present and
-    breaking AC1. Defaults to `["http://localhost:3000", "http://127.0.0.1:3000"]`."""
+    breaking AC1. Defaults to `["http://localhost:3000", "http://127.0.0.1:3000"]`.
+
+    Neither route accepts a client-supplied request id (Q12) — `query_stream` mints its own."""
 
 
 async def query_stream(app: FastAPI, req: QueryRequest) -> AsyncIterator[dict[str, str]]:
     """The SSE generator: run the graph, emit `meta`, drain the answer stream emitting one
-    `token` event per chunk, then `citations`, then `done`.
+    `token` event per chunk, then ONE `citations` event carrying the whole array, then `done`.
 
-    Yields sse-starlette event dicts ({"event": ..., "data": ...}). Any exception is caught
-    and converted into a terminal `error` event — this generator never raises to the caller."""
+    Mints `request_id = str(uuid4())` server-side (Q12) and builds the 5-key intake exactly as
+    run_query.py:40-49 does — `original_query`, `query`, `request_id`, `user_id`, `iteration=0`.
+    `QueryRequest` has no id field to honour, by design.
+
+    Yields sse-starlette event dicts ({"event": ..., "data": ...}) whose `data` is always a
+    JSON string (D6/Q8). Any exception is caught and converted into a terminal `error` event —
+    this generator never raises to the caller."""
 
 
 # ── scripts/run_api.py ── dev entrypoint ──
@@ -244,6 +269,19 @@ def main() -> None:
    followed by an `error` event with `phase="stream"`. In both cases HTTP status is 200 and the
    generator does not propagate. `ErrorEvent.message` contains no traceback, no DSN, and no DB URL.
 
+   **`answer_stream is None` → `phase="graph"` (Q10).** `run_query.py:56` handles this with a bare
+   `assert`; the API must emit an `error` event instead. The phase is `"graph"`, not `"stream"`: the
+   graph failed to produce a stream at all, so the drain never began and there is nothing for
+   `"stream"` to describe. No `token` events precede it.
+
+   **The terminal event always carries `degraded` (N1).** `done` and `error` are both terminal and
+   mutually exclusive — `error` does NOT get a trailing `done`, because that would break the
+   terminal-event contract and give the client two endings to reconcile. So the breaker signal rides
+   on whichever one fires: `DoneEvent.degraded` on success, `ErrorEvent.degraded` on failure. A run
+   that degrades and then fails mid-drain must still report `degraded=True` — that combination is the
+   exact case this rule exists for. On the `phase="graph"` path the drain never ran, so the breaker
+   was never gated and `degraded` is `False`.
+
 8. **Footer parity (INTERSECTION, amended 13 Aug 2026).** The **intersection** of `MetaEvent`'s
    fields and `run_query.py`'s footer keys carries **identical values for the same run**. Two
    documented exceptions, both directional and both intentional:
@@ -281,6 +319,17 @@ def main() -> None:
 14. **Gates.** `ruff` clean, `mypy --strict` clean, full `pytest` green. All new tests use fakes —
     **zero Groq calls, zero Neon connections** in the default suite. Any live check is
     `@pytest.mark.live` and excluded by default.
+
+15. **One `citations` event carrying an array (Q9).** A successful request emits the `citations` event
+    **exactly once**, and its payload is a JSON **array** of `CitationOut` — never one event per
+    citation, and never a bare object. The array is emitted even when it is empty (`[]`), which is
+    what AC4's "emitted even when the list is empty" already implied but did not say outright. *Why:*
+    a per-citation event stream gives the client no way to know the list has ended without waiting
+    for `done`, and it makes the empty case indistinguishable from the not-yet-arrived case — the
+    consumer would have to reconstruct an array the server already had in hand.
+    *(Appended as AC15 rather than inserted, deliberately: AC8 and AC9 are referenced by number in
+    the amendment section below and in the S18 implementation plan, so the existing numbering is
+    load-bearing and is not reflowed.)*
 
 ---
 
@@ -369,3 +418,28 @@ signatures (S16), the `Citation` field set (`state.py:136`, identical to `Citati
 `run_query.py` intake keys, and the `reason=` / `confidence_reason` label trap G4 already called out.
 `fastapi`, `uvicorn[standard]`, and `sse-starlette` are all already declared and installed — S18 adds
 no dependency.
+
+### Second pass (same day) — degraded-signal gap + the four remaining open questions
+
+Moving `degraded` off `meta` (Q1, above) opened a hole that the first pass did not close, found while
+reconciling AC4's event sequence against AC7's error paths:
+
+- **N1 — the degraded signal could be lost entirely.** AC7 terminates a failed run with `error` and
+  **no** `done`, so once `degraded` lived only on `DoneEvent`, a run that degraded (breaker OPEN,
+  serving `degraded_stream`) and *then* failed mid-drain reported its degradation nowhere. The fix is
+  **not** to emit `done` after `error` — two terminal events is a worse contract than a missing flag.
+  `ErrorEvent` gains `degraded: bool`, and the rule becomes: **the flag rides on whichever terminal
+  event fires.** See AC7.
+
+The four questions the first pass left open are now closed:
+
+| # | Question | Answer |
+|---|---|---|
+| Q9 | `citations`: one event per citation, or one array? | **One event, one array**, emitted exactly once, `[]` when empty. New **AC15** |
+| Q10 | `answer_stream is None` — which `phase`? | **`"graph"`.** The graph failed to produce a stream; the drain never began, so `"stream"` describes nothing. AC7 |
+| Q11 | `token_count` semantics | Counts **emitted `token` events**, not model tokens and not a billing figure. Field name kept; `DoneEvent` docstring now says so explicitly |
+| Q12 | `request_id` provenance | **Server-side `uuid4()`**, mirroring run_query.py's intake (S16 G4). `QueryRequest` has no id field — a client-supplied id is a trace-poisoning surface and would break CLI/HTTP correspondence |
+
+Also corrected in this pass: **D4's heading and prose said "two-phase metadata"**, which stopped being
+accurate once `DoneEvent` grew `latency_s` / `token_count` / `degraded`. The locked decision is
+unchanged — metadata before the answer *and* after it — only the phrasing was fixed.
