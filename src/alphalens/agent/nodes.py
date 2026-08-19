@@ -375,6 +375,8 @@ async def hybrid_search_cell(
     k_lexical: int,
     rrf_c: int,
     n_per_cell: int,
+    acquire_timeout: float,
+    query_timeout: float,
 ) -> list[RetrievedChunk]:
     """Run the parameterized hybrid query for one cell and return up to n_per_cell enriched
     RetrievedChunks, RRF-ordered. All inputs are asyncpg placeholders -- no interpolation.
@@ -382,18 +384,46 @@ async def hybrid_search_cell(
     Lexical ranking is ts_rank_cd (NOT BM25 -- L1). The vector is bound as a list[float] and
     relies on the pgvector codec registered at pool init (init=register_pgvector, same as
     etl/runner.py); the SQL's $1::vector cast is belt-and-braces.
+
+    TWO budgets, passed in like every other tunable here (the caller owns config). Acquire is
+    the leg that actually stalls this function: retrieve_node gathers one call per cell against
+    a max_size=5 pool, so cells 6+ queue -- and an unbounded asyncpg acquire waits forever
+    (pool.py:891-899). `pool.fetch(q, timeout=T)` cannot express this: it bounds only the query
+    and calls a bare `self.acquire()` (pool.py:613-634), hence the explicit acquire here.
+
+    The `async with` is load-bearing beyond style: it releases on EVERY path including the
+    TimeoutError re-raise below, and one leaked connection starves the whole fan-out.
     """
-    rows = await pool.fetch(
-        _HYBRID_CELL_SQL,
-        query_vector,
-        ticker,
-        year,
-        k_vector,
-        sub_question,
-        k_lexical,
-        rrf_c,
-        n_per_cell,
-    )
+    acquired = False
+    try:
+        async with pool.acquire(timeout=acquire_timeout) as con:
+            acquired = True
+            rows = await con.fetch(
+                _HYBRID_CELL_SQL,
+                query_vector,
+                ticker,
+                year,
+                k_vector,
+                sub_question,
+                k_lexical,
+                rrf_c,
+                n_per_cell,
+                timeout=query_timeout,
+            )
+    except TimeoutError:
+        # The flag is what keeps the two legs apart: a query breach raised inside the `async
+        # with` would otherwise be logged here as an acquire breach. Cell identity is included
+        # because one slow (ticker, year) is the shape a fan-out stall actually takes.
+        leg, budget = ("query", query_timeout) if acquired else ("acquire", acquire_timeout)
+        _log.error(
+            # %g not %.1f: a sub-second budget must not be reported as "0.0s".
+            "retrieval timed out on the %s leg after %gs (cell %s/%d)",
+            leg,
+            budget,
+            ticker,
+            year,
+        )
+        raise
     return [
         RetrievedChunk(
             chunk_id=row["chunk_id"],
@@ -463,6 +493,8 @@ async def retrieve_node(state: AgentState, runtime: Runtime[AgentContext]) -> di
                 k_lexical=cfg.retrieval_k_lexical,
                 rrf_c=cfg.retrieval_rrf_c,
                 n_per_cell=cfg.retrieval_n_per_cell,
+                acquire_timeout=cfg.agent_pool_acquire_timeout_seconds,
+                query_timeout=cfg.agent_command_timeout_seconds,
             )
             for (t, y, sq) in cells
         )

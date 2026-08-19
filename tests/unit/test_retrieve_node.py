@@ -57,16 +57,60 @@ class _FakeEmbedder:
         )
 
 
+class _FakeConn:
+    """Fake pool-acquired connection: ``fetch`` returns canned rows and records (sql, args).
+
+    Recording lives on the owning _FakePool so ``fetch_calls`` stays the assertion surface it
+    was before retrieval moved behind an explicit ``acquire``.
+    """
+
+    def __init__(self, pool: _FakePool) -> None:
+        self._pool = pool
+
+    async def fetch(self, sql: str, *args: Any, timeout: float | None = None) -> list[Any]:
+        self._pool.fetch_calls.append((sql, args))
+        self._pool.fetch_timeouts.append(timeout)
+        if self._pool.raise_on_fetch is not None:
+            raise self._pool.raise_on_fetch
+        return list(self._pool.rows)
+
+
+class _AcqCtx:
+    """``pool.acquire(timeout=...)`` stand-in -- an async CM, mirroring test_runner.py:152."""
+
+    def __init__(self, pool: _FakePool) -> None:
+        self._pool = pool
+
+    async def __aenter__(self) -> _FakeConn:
+        if self._pool.raise_on_acquire is not None:
+            raise self._pool.raise_on_acquire
+        self._pool.acquired += 1
+        return _FakeConn(self._pool)
+
+    async def __aexit__(self, *_: Any) -> None:
+        self._pool.released += 1
+
+
 class _FakePool:
-    """Fake asyncpg Pool: ``fetch`` returns canned rows (dicts) and records (sql, args)."""
+    """Fake asyncpg Pool exposing the two-budget shape: ``acquire(timeout=)`` -> ``fetch(timeout=)``.
+
+    Records both budgets so tests can assert each leg is bounded, and can be told to breach
+    either leg so the per-leg logging is testable without a real pool.
+    """
 
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
-        self._rows = rows if rows is not None else []
+        self.rows = rows if rows is not None else []
         self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetch_timeouts: list[float | None] = []
+        self.acquire_timeouts: list[float | None] = []
+        self.acquired = 0
+        self.released = 0
+        self.raise_on_acquire: BaseException | None = None
+        self.raise_on_fetch: BaseException | None = None
 
-    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
-        self.fetch_calls.append((sql, args))
-        return list(self._rows)
+    def acquire(self, *, timeout: float | None = None) -> _AcqCtx:
+        self.acquire_timeouts.append(timeout)
+        return _AcqCtx(self)
 
 
 # ── Builders ──────────────────────────────────────────────────────────────────
@@ -286,6 +330,8 @@ async def test_ac3_hybrid_search_cell_maps_and_enriches_rows() -> None:
         k_lexical=20,
         rrf_c=60,
         n_per_cell=10,
+        acquire_timeout=30.0,
+        query_timeout=10.0,
     )
 
     assert [c.chunk_id for c in result] == ["c1", "c2", "c3"]  # DB (RRF) order preserved
@@ -325,3 +371,82 @@ async def test_ac8_n_per_cell_env_override_flows_into_limit_bind(
         assert args[7] == 3  # $8 == n_per_cell, overridden from the default 10
     finally:
         get_settings.cache_clear()  # restore the shared settings singleton for other tests
+
+
+# ── S_agent_pool_timeouts AC2/AC4/AC5: both legs bounded, and distinguishable ──
+
+
+async def test_both_timeout_budgets_reach_the_pool_from_config() -> None:
+    """AC5: retrieve_node threads BOTH budgets down; neither leg is left unbounded.
+
+    Asserted against live config rather than literals, so a default change cannot leave this
+    test passing while the wiring silently reverts to None.
+    """
+    cfg = get_settings()
+    embedder = _FakeEmbedder()
+    pool = _FakePool()
+    ctx = _ctx(embedder=embedder, pool=pool)
+
+    await retrieve_node(_state(_plan(["AAPL"], [2023], ["q"])), _runtime(ctx))
+
+    assert pool.acquire_timeouts == [cfg.agent_pool_acquire_timeout_seconds]
+    assert pool.fetch_timeouts == [cfg.agent_command_timeout_seconds]
+
+
+async def test_acquire_breach_names_the_acquire_leg_and_the_cell(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC4: an acquire breach is attributed to acquire -- not conflated with a slow query."""
+    pool = _FakePool()
+    pool.raise_on_acquire = TimeoutError()
+
+    with caplog.at_level("ERROR"), pytest.raises(TimeoutError):
+        await hybrid_search_cell(
+            cast(Pool, pool),
+            query_vector=[0.1],
+            sub_question="revenue",
+            ticker="AAPL",
+            year=2023,
+            k_vector=20,
+            k_lexical=20,
+            rrf_c=60,
+            n_per_cell=10,
+            acquire_timeout=1.5,
+            query_timeout=9.0,
+        )
+
+    assert "acquire leg" in caplog.text and "1.5s" in caplog.text
+    assert "AAPL/2023" in caplog.text  # cell identity: which cell stalled
+    assert "query leg" not in caplog.text
+
+
+async def test_query_breach_names_the_query_leg_and_releases_the_connection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC4 + Gotcha 2: the query leg is named, and the connection is still released.
+
+    The release matters more than the label here: retrieve_node fans out against a max_size=5
+    pool, so one connection leaked on the error path starves every remaining cell.
+    """
+    pool = _FakePool()
+    pool.raise_on_fetch = TimeoutError()
+
+    with caplog.at_level("ERROR"), pytest.raises(TimeoutError):
+        await hybrid_search_cell(
+            cast(Pool, pool),
+            query_vector=[0.1],
+            sub_question="revenue",
+            ticker="MSFT",
+            year=2024,
+            k_vector=20,
+            k_lexical=20,
+            rrf_c=60,
+            n_per_cell=10,
+            acquire_timeout=30.0,
+            query_timeout=2.5,
+        )
+
+    assert "query leg" in caplog.text and "2.5s" in caplog.text
+    assert "MSFT/2024" in caplog.text
+    assert "acquire leg" not in caplog.text  # the `acquired` flag keeps the legs apart
+    assert pool.acquired == 1 and pool.released == 1  # released despite the re-raise
