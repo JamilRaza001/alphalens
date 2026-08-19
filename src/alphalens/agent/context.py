@@ -15,6 +15,8 @@ with the S9 ``register_pgvector`` codec on every connection (G1/G2 -- required f
 
 from __future__ import annotations
 
+import logging
+
 import asyncpg
 from asyncpg import Pool
 from langchain_groq import ChatGroq
@@ -26,6 +28,8 @@ from alphalens.config import Settings, get_settings
 from alphalens.etl.embeddings import EmbeddingClient  # S8 (jina-v3 query embeddings)
 from alphalens.etl.upsert import register_pgvector  # S9 -- REUSE, do NOT reimplement
 
+_log = logging.getLogger(__name__)
+
 
 async def build_agent_pool(settings: Settings) -> Pool:
     """Create the agent asyncpg pool with the pgvector codec registered on EVERY connection.
@@ -34,6 +38,13 @@ async def build_agent_pool(settings: Settings) -> Pool:
     ``max_size=5``, ``init=register_pgvector``, prepared statements ON (NO
     ``statement_cache_size=0``). The endpoint is config-driven via ``agent_db_url`` (POOLED
     default; env ``AGENT_DB_URL`` overrides for a scale-flip) -- S16/D-endpoint.
+
+    Both timeout kwargs travel through asyncpg's ``**connect_kwargs`` onto every connection
+    the pool opens. ``command_timeout`` is not merely belt-and-braces: ``register_pgvector``
+    runs as the ``init=`` callback and issues codec round-trips that NO call site can wrap,
+    so the pool-level default is the only thing that can bound them. It is deliberately NOT
+    an acquire budget -- asyncpg has no such pool-level knob (``Pool.__init__`` has no
+    timeout slot), which is why each agent call site passes its own.
     """
     dsn = (settings.agent_db_url or settings.neon_database_url).get_secret_value()
     pool: Pool = await asyncpg.create_pool(
@@ -41,17 +52,45 @@ async def build_agent_pool(settings: Settings) -> Pool:
         min_size=settings.agent_pool_min_size,
         max_size=settings.agent_pool_max_size,
         init=register_pgvector,
+        timeout=settings.agent_pool_connect_timeout_seconds,
+        command_timeout=settings.agent_command_timeout_seconds,
     )
     return pool
 
 
-async def load_ticker_universe(pool: Pool) -> tuple[frozenset[str], dict[str, str]]:
+async def load_ticker_universe(
+    pool: Pool,
+    *,
+    acquire_timeout: float,
+    query_timeout: float,
+) -> tuple[frozenset[str], dict[str, str]]:
     """One cold-start query on ``companies`` -> ``(allowed_tickers, ticker_roster)`` (D3a).
 
     The frozenset is the hard input-rail (``validate_tickers``); the roster (ticker->name) is
     injected into the Plan system prompt so word->ticker resolution is grounded, not guessed.
+
+    TWO budgets, not one. ``pool.fetch(q, timeout=T)`` would bound only the query -- asyncpg's
+    ``Pool.fetch`` calls a bare ``self.acquire()`` and never forwards ``T`` (pool.py:613-634),
+    and a ``None`` acquire timeout awaits the connection queue forever (pool.py:891-899). The
+    two legs stay separately identifiable because they have opposite fixes: acquire starvation
+    means pool sizing, a slow query means SQL or indexes.
+
+    CALLER BEWARE: this runs inside the FastAPI lifespan ABOVE the ``try:`` at ``app.py:69``,
+    so a breach here kills startup and has no ``ErrorEvent`` path. That is intended -- loud
+    beats silent -- but it is NOT the request-scoped path.
     """
-    rows = await pool.fetch("SELECT ticker, name FROM companies")
+    acquired = False
+    try:
+        async with pool.acquire(timeout=acquire_timeout) as con:
+            acquired = True
+            rows = await con.fetch("SELECT ticker, name FROM companies", timeout=query_timeout)
+    except TimeoutError:
+        # The flag is what keeps the two legs apart: a query breach raised inside the `async
+        # with` would otherwise be logged here as an acquire breach.
+        leg, budget = ("query", query_timeout) if acquired else ("acquire", acquire_timeout)
+        # %g not %.1f: a sub-second budget must not be reported as "0.0s".
+        _log.error("ticker universe load timed out on the %s leg after %gs", leg, budget)
+        raise
     roster: dict[str, str] = {row["ticker"]: row["name"] for row in rows}
     return frozenset(roster), roster
 
@@ -70,7 +109,11 @@ async def build_context(settings: Settings | None = None) -> tuple[AgentContext,
     settings = settings or get_settings()
 
     pool = await build_agent_pool(settings)
-    allowed_tickers, ticker_roster = await load_ticker_universe(pool)
+    allowed_tickers, ticker_roster = await load_ticker_universe(
+        pool,
+        acquire_timeout=settings.agent_pool_acquire_timeout_seconds,
+        query_timeout=settings.agent_command_timeout_seconds,
+    )
 
     # api_key passed explicitly (G6): pydantic-settings loads .env into Settings, not
     # os.environ, so ChatGroq's GROQ_API_KEY env fallback is not guaranteed at run time.
