@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     agent_db_url: SecretStr | None = None
     agent_pool_min_size: int = 1
     agent_pool_max_size: int = 5
+    # Bounded waits on the agent pool. asyncpg leaves TWO of the three waits unbounded by
+    # default (acquire = None = forever; command_timeout = None = forever), so a stall is
+    # silent rather than diagnostic. Every agent-path call site passes its own acquire budget —
+    # Pool.__init__ has no timeout slot, so there is nothing pool-level to inherit.
+    agent_pool_connect_timeout_seconds: float = 30.0  # TCP/TLS/auth + init=; absorbs a cold resume
+    agent_pool_acquire_timeout_seconds: float = 30.0  # wait for a free connection (fan-out)
+    # ~50x measured steady state (~0.21 s/cell) and ~9x the worst observed first query (~1.08 s).
+    # Also applies pool-wide (create_pool), so it must clear cold-start load_ticker_universe and
+    # the register_pgvector codec round-trips — do not tune below cold-start cost.
+    agent_command_timeout_seconds: float = 10.0
 
     # ── Cloudflare R2 ─────────────────────────────────────────────────────────
     r2_account_id: str
