@@ -384,3 +384,84 @@ a short run may complete before any ping is emitted. Absence of a ping in a
 capture is **not** evidence that the guard was exercised. Unless a ping frame is
 actually visible in the raw bytes, the outcome is recorded as *"G2 not observed
 on the wire; covered by unit test only"* — never as *"G2 wire-confirmed"*.
+
+---
+
+## Amendment 2 (25 Aug 2026) — three claims corrected after the live runs
+
+**Same convention as Amendment 1: everything above is left unedited.** It records
+what was believed at authoring time; this section records what measurement found.
+
+### 2.1 — The multi-`data:` join is protocol identity, not spec correctness
+
+Amendment 1's "Carried, not in the original spec" paragraph calls `parseFrame`'s
+joining of multiple `data:` lines with `\n` "two lines of code for spec
+correctness". **The claim is wrong. The code is right.**
+
+Every `data:` on this wire is `json.dumps` output (S18 D6/Q8), and `json.dumps`
+escapes newlines as `\n` *inside* the string. A payload that would force
+`event.py:49-51` to split across multiple `data:` lines therefore never forms.
+And had one formed, the rejoined string would carry a literal newline inside a
+JSON scalar — which `JSON.parse` rejects — so the join could not have rescued it.
+
+The join is retained because it is what SSE *is*: a multi-line `data:` field
+means one payload separated by newlines, and a parser that keeps only the last
+line is not an SSE parser. It buys protocol conformance, not correctness against
+this server. **Unreachable in v1 either way.**
+
+Same class, recorded not fixed: `parseFrame` returns `null` silently on a raw
+CRLF frame. That is contract-guarded (`splitFrames` normalises first), not
+code-guarded.
+
+### 2.2 — AC3's instrument is "by eye", and that is the root cause of a withdrawn PASS
+
+AC3 above requires tokens to render progressively, "**Verified by eye** against a
+real run". **That instrument is insufficient, and it produced a false PASS that
+survived two sessions before being withdrawn.**
+
+What happened: the result was accepted from a leading question ("did tokens
+arrive progressively or in a lump?") put to the operator, while the real
+instrument — the DevTools EventStream timestamp column — sat open and unread.
+
+**The instrument for AC3 is the arrival timestamp of the first and last `token`
+frame. Not the eye, and not a question put to the operator.**
+
+Measured 25 Aug 2026 at `7b8887e`: `meta` and the deterministic caveat token
+(`_prepend_caveat`, K1) share t=0; the first synthesis token lands t+1.3 s — that
+gap is Groq TTFT, not client latency, and reproduced at t+2.1 s on an earlier
+run; the remaining 312 `token` events plus `citations` plus `done` all fall
+inside one 0.1 s bucket. **Token spread = 0.7 s for 312 events.**
+
+At that spread, progressive and batched rendering are indistinguishable by any
+instrument available to this project. `page.tsx` contains no batching, and S18's
+own G3 (server-side progressive delivery) passed on a different run — so the
+underlying behaviour is not in doubt; only the client-side twin is unmeasurable.
+**AC3's status on this corpus is NOT FALSIFIED / UNVERIFIABLE, not PASS.** It
+becomes measurable when a synthesis runs long enough to spread its tokens — i.e.
+after the v2 iXBRL re-ingest gives the model actual figures to write about.
+
+**Knock-on: AC9's retention clause inherits the same 0.7 s window** and is
+likewise unexercisable here. Two runs were spent missing it; the window is under
+human reaction time once row-recognition is included. That is a corpus property,
+not a discipline failure — **no further run should be spent on it before v2.**
+
+### 2.3 — AC12's instrument reads the wrong exit code
+
+AC12 verifies that the env example is not swallowed by `.gitignore`, using
+`git check-ignore -v`. **The exit-code semantics are inverted from what the AC
+assumes.**
+
+Measured on `.env.local.example`: `-v` exits **0**, `-q` exits **1**. `-v` exit 0
+means "matched some pattern", and a match includes a *negation* pattern. Only
+`-q` exit 0 means "this path is ignored".
+
+So `git check-ignore -v` exiting 0 is entirely compatible with the file being
+tracked — which is exactly the situation here. **The AC passed; its instrument
+did not prove it.** The outcome was confirmed separately with `-q`.
+
+`-q` is the correct instrument for "is this ignored".
+
+---
+
+**Zero code changes follow from this amendment.** All three corrections are to
+claims and instruments, never to `frontend/` source. `7b8887e` remains S19 HEAD.
