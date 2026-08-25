@@ -687,3 +687,100 @@ env fallback is not guaranteed at run time. See the corrected \`build\_context\`
 empty-flow + honest synthesis, \*\*not\*\* an early \`END\`. Keep each node's empty-input handling intact — that is
 
 what prevents a silent mis-answer without adding a conditional edge.
+
+---
+
+## Amendment (25 Aug 2026) — AC14 discharged
+
+**Everything above is left unedited**, including AC14's "TRACKED FOLLOW-UP —
+scaffold only" status line and its deferral rationale. That text records what was
+believed at authoring time; this section records what implementation found.
+
+### The deferral is spent
+
+AC14's original block deferred the structural assertions until "a representative
+run after the retrieval-quality fix lands", on the grounds that the only runs
+observed were the year-concatenation failure and a ticker-skewed 7 AAPL : 1 MSFT
+run. Both conditions are now discharged: **S17's per-pair selection floor landed**
+(`d934222` — see the S17 row in `docs/PROJECT_STATUS.md`), and the test is authored
+against the AC13 shape, a two-ticker x two-year comparative:
+
+    "Compare Apple's and Microsoft's R&D spend in fiscal 2023 vs 2024."
+
+### Correction — `status ∈ {ok, degraded}` names a key that does not exist
+
+The AC14 docstring block above (and the D4 code sketch it quotes) pins
+`status ∈ {ok, degraded}` as a structural invariant. **No such key exists.**
+`AgentState` has no `status` member, and the literals `"ok"` and `"degraded"`
+appear nowhere in `src/alphalens/agent/`. **The spec was wrong, not the code** —
+a spec defect found at implementation time, the same class as S19's Amendment 2.
+
+The implemented invariant uses the two labels that do exist:
+
+| Pinned by the spec | Implemented against |
+|---|---|
+| `status ∈ {ok, degraded}` | `confidence: Literal["low", "high"]` (`state.py:197`) |
+| — | `confidence_reason: Literal["coverage", "llm", "none"]` (`state.py:198`) |
+
+`confidence_reason` has no counterpart in the spec's sketch at all; it is carried
+because it is what makes a `low` verdict diagnosable (coverage-driven vs
+LLM-driven).
+
+### The six implemented assertions
+
+- **A1** — the drained-and-joined answer text is non-empty after stripping.
+- **A2** — at least one citation is returned.
+- **A3** — every `citation.ticker` is in `ctx.allowed_tickers`.
+- **A4** — every `query_plan.tickers` entry is in `ctx.allowed_tickers`.
+- **A5** — `confidence` is one of `{"low", "high"}` and `confidence_reason` is one
+  of `{"coverage", "llm", "none"}`.
+- **A6** — pair closure: every planned `(ticker, year)` cell is accounted for.
+
+A3 and A4 gate against `AgentContext.allowed_tickers` (`frozenset[str]`,
+`nodes.py:69`), **not** `ticker_roster` (`Mapping[str, str]`, `nodes.py:72`). The
+two coexist on the context and are not interchangeable.
+
+### A6 is an ADDITION, not a restatement
+
+The spec pinned four invariants; A6 is a **fifth, added at implementation time**
+and recorded here as new scope rather than as a reading of what was already
+written. It asserts that for every `(t, y)` in
+`query_plan.tickers x query_plan.time_range.years`, at least one of the following
+holds: the pair appears among the citations as `(c.ticker, c.period_year)`; or it
+is named in `coverage_gaps`, `capacity_drops`, or `dropped_for_capacity`; or `t`
+is in `unavailable_tickers`; or `y` is in `unavailable_years`.
+
+Why it earns its place: A1–A5 can all pass while the graph silently drops a
+planned cell between Plan and the answer. A6 says every cell the plan asked for
+either produced evidence or was explicitly declared missing by a named rail. Its
+failure message names the specific unaccounted pair(s).
+
+### Measured
+
+    command : uv run pytest -m live -v
+    result  : 1 passed, 301 deselected in 30.13s
+    commit  : 7dd9f8e ("test(S16): author AC14 live structural assertions,
+              replacing the skip scaffold")
+    file    : tests/integration/test_agent_live.py
+
+Run once, on the query above.
+
+### KNOWN LIMIT — a PASS does not mean coverage was observed
+
+The test prints nothing on success, so **it is not recorded which branch of A6
+each planned pair took.** A pair that was cited and a pair that was declared
+missing by `coverage_gaps` both satisfy A6 identically and leave no trace in the
+output.
+
+Green therefore means exactly one thing: *no planned pair went unaccounted for.*
+It does **not** mean the corpus covered the query, that any pair was cited, or
+that the honesty rails stayed empty. A run in which every planned cell landed in
+`coverage_gaps` passes A6 — and would still pass A2 on a single citation from
+some other cell. **Do not read corpus coverage out of this PASS.** Determining
+which branch each pair took requires reading the failure-message fields on a
+deliberate failure, or the `run_query.py` footer, not this test.
+
+---
+
+**No code change follows from this amendment.** The corrections are to this
+spec's claims, never to `src/alphalens/`. `7dd9f8e` remains S16 HEAD.
